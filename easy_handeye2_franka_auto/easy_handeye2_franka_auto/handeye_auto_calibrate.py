@@ -96,7 +96,10 @@ def main(args=None):
         source.stop_polling()
 
         source.refresh()
-        pos, quat = source.latest()
+        latest = source.latest()
+        if latest is None:
+            raise RuntimeError('No EE pose after free-drive refresh')
+        pos, quat = latest
         home = snapshot_to_pose_4x4(pos, quat)
         targets = compute_poses_around_state(
             home, math.radians(cli.rotation_delta_degrees), cli.translation_delta_meters)
