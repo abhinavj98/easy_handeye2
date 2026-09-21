@@ -5,8 +5,8 @@ robot:
   control_rate_hz: 1000.0      # high-level control/data-collection rate; PRO callback is fixed at 1 kHz
   joint_velocity_max_delta_per_step: 0.003
   joint_velocity_max_jerk: 1000.0  # rad/s^3; smooths acceleration at replay start
-  reset_duration_sec: 5  # Duration for Cartesian reset motion
-  reset_hold_sec: 0.5    # Hold current pose before ramping (avoids discontinuity reflex)
+  reset_duration_sec: 8  # Slower Cartesian moves reduce discontinuity reflexes
+  reset_hold_sec: 0.5    # Hold current pose before ramping
 
   # Per-episode FT calibration: hold position and average O_F_ext_hat_K
   # for this many seconds before each episode. Replaces static ft_bias.

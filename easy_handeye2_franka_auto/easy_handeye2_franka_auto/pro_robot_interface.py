@@ -301,46 +301,49 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                             float(t[0]), float(t[1]), float(t[2]), 1.0,
                         ]
 
-                    # Hold current pose before ramping. A single step-0 write of
-                    # initial_pose then a reconstructed interp frame often trips
-                    # cartesian_motion_generator_*_discontinuity after free-drive.
+                    def _quintic(t: float) -> float:
+                        # Zero vel AND zero accel at endpoints. Cosine ease
+                        # only zeros velocity; Franka treats the leftover
+                        # acceleration jump as cartesian_*_discontinuity.
+                        return t * t * t * (10.0 - 15.0 * t + 6.0 * t * t)
+
+                    # Hold current pose before ramping (raw O_T_EE encoding).
                     hold_sec = float(robot_cfg.get('reset_hold_sec', 0.5))
                     hold_steps = max(int(hold_sec * 1000), 1)
                     n_steps = max(int(reset_duration_sec * 1000), 1)
-                    start_cmd = _pose_flat(start_R, start_t)
 
                     import gc
                     gc.disable()
                     try:
                         for _ in range(hold_steps):
-                            # Prefer libfranka's raw O_T_EE on the very first write
                             pose_cmd = CartesianPose(initial_pose)
                             ctrl.writeOnce(pose_cmd)
                             state, _ = ctrl.readOnce()
                             initial_pose = state.O_T_EE
 
-                        # Re-base interpolation on the held pose (same encoding as ramp).
+                        # Re-base interpolation on the held pose.
                         start_flat = np.array(state.O_T_EE)
                         start_R = np.array([
                             [start_flat[0], start_flat[4], start_flat[8]],
                             [start_flat[1], start_flat[5], start_flat[9]],
                             [start_flat[2], start_flat[6], start_flat[10]],
                         ])
-                        start_t = start_flat[12:15]
+                        start_t = start_flat[12:15].copy()
                         start_q = _rotation_matrix_to_quat_wxyz_np(start_R)
-                        start_cmd = _pose_flat(start_R, start_t)
 
                         for i in range(1, n_steps + 1):
-                            alpha = 0.5 * (1.0 - math.cos(math.pi * i / n_steps))
-                            if alpha <= 0.0:
-                                interp_flat = start_cmd
+                            alpha = _quintic(i / n_steps)
+                            # Keep bit-exact start encoding until the profile
+                            # actually moves — reconstructing R from quat(R)
+                            # is not identical to O_T_EE and trips discontinuity.
+                            if alpha < 1e-9:
+                                pose_list = start_flat.tolist()
                             else:
                                 interp_t = (1.0 - alpha) * start_t + alpha * target_t
                                 interp_q = _quat_slerp(start_q, target_q, alpha)
                                 interp_R = _quat_wxyz_to_rotation_matrix_np(interp_q)
-                                interp_flat = _pose_flat(interp_R, interp_t)
-
-                            pose_cmd = CartesianPose(interp_flat)
+                                pose_list = _pose_flat(interp_R, interp_t)
+                            pose_cmd = CartesianPose(pose_list)
                             if i == n_steps:
                                 pose_cmd.motion_finished = True
                                 ctrl.writeOnce(pose_cmd)
