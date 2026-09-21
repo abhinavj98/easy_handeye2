@@ -1,11 +1,12 @@
 # Default robot config for easy_handeye2_franka_auto (use_mock true for safe bring-up)
 robot:
   ip: "192.168.1.11"
-  use_mock: true              # Set false for real robot
+  use_mock: false             # Set true for offline mock (no real motion)
   control_rate_hz: 1000.0      # high-level control/data-collection rate; PRO callback is fixed at 1 kHz
   joint_velocity_max_delta_per_step: 0.003
   joint_velocity_max_jerk: 1000.0  # rad/s^3; smooths acceleration at replay start
   reset_duration_sec: 5  # Duration for Cartesian reset motion
+  reset_hold_sec: 0.5    # Hold current pose before ramping (avoids discontinuity reflex)
 
   # Per-episode FT calibration: hold position and average O_F_ext_hat_K
   # for this many seconds before each episode. Replaces static ft_bias.
