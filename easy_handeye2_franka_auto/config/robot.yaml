@@ -1,0 +1,51 @@
+# Default robot config for easy_handeye2_franka_auto (use_mock true for safe bring-up)
+robot:
+  ip: "192.168.1.11"
+  use_mock: true              # Set false for real robot
+  control_rate_hz: 1000.0      # high-level control/data-collection rate; PRO callback is fixed at 1 kHz
+  joint_velocity_max_delta_per_step: 0.003
+  joint_velocity_max_jerk: 1000.0  # rad/s^3; smooths acceleration at replay start
+  reset_duration_sec: 5  # Duration for Cartesian reset motion
+
+  # Per-episode FT calibration: hold position and average O_F_ext_hat_K
+  # for this many seconds before each episode. Replaces static ft_bias.
+  ft_calibration_duration_sec: 3
+
+  # NE_T_EE: Identity — F_T_NE (configured in Franka Desk) already contains
+  # R_z(-45°) + T_z(0.1034), which matches the sim's panda_hand body frame
+  # (URDF rpy="0 0 -0.7854"). Setting NE_T_EE to identity means
+  # F_T_EE = F_T_NE = R_z(-45°) + T_z(0.1034), so the Jacobian and O_T_EE
+  # reference the fingertip midpoint with the correct sim-matching orientation.
+  # Column-major 4x4 homogeneous transform [R|t; 0 0 0 1]
+  NE_T_EE: [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0
+  ]
+
+
+  # Stiffness frame = EE frame (identity) - forces measured at fingertip
+  EE_T_K: [
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0
+  ]
+
+  # F/T EMA low-pass filter coefficient (applied at 1kHz inside read_state)
+  # alpha=0.2 at 1kHz ~ 32Hz cutoff frequency (-3dB)
+  ft_ema_alpha: .05
+
+  # Constant F/T bias subtracted from O_F_ext_hat_K BEFORE negation/rotation.
+  # Measured in free space with check_ft_bias.py — compensates for unmodeled
+  # EE payload (peg + gripper fingers) that the robot's gravity model misses.
+  # Set to [0,0,0,0,0,0] to disable.
+  # ft_bias: [-2.3233, -0.0368, 0.2142, 0.2584, -0.9019, -0.0218]
+  # ft_bias: [0.4635, -2.8804, 1.8923, 1.908, 0.2498, 0.0782]
+  # ft_bias: [0, 0, 0, 0, 0, 0]
+  # ft_bias: [-0.5978, -2.9898, 1.5221, 1.6927, -0.3472, 0.0992]
+  ft_bias: [0, 0, 0, 0, 0, 0]  
+  # ft_bias: [-0.8578, -1.4123, 0.9413, 0.7662, -0.4923, 0.1242]
+  
+    
