@@ -4,7 +4,7 @@
 
 **Goal:** Add package `easy_handeye2_franka_auto` that free-drive-captures a start pose, moves through A-style EE offsets via vendored pylibfranka `FrankaInterface`, publishes robot `tf`, and auto-samples/saves an eye-on-base calibration through `easy_handeye2`.
 
-**Architecture:** Sibling ROS 2 Python package vendors the full Continuous_Force_RL PRO robot stack (Option 1). New modules generate 4×4 offset poses, bridge EE pose to `/tf`, and drive the sample/compute/save loop. Stock `easy_handeye2` stays freehand; `franka_ros2` hardware must be off while pylibfranka owns the arm.
+**Architecture:** Sibling ROS 2 Python package vendors the full Continuous_Force_RL PRO robot stack (Option 1). New modules generate 4×4 offset poses, wrap the robot in a lock-guarded pose source, publish its *cached* EE pose to `/tf`, and drive the sample/compute/save loop. Stock `easy_handeye2` stays freehand; `franka_ros2` hardware must be off while pylibfranka owns the arm.
 
 **Tech Stack:** ROS 2 (`rclpy`, `tf2_ros`), `easy_handeye2` / `easy_handeye2_msgs`, `pylibfranka`, `numpy`, `torch`, `pytest`, `PyYAML`
 
@@ -18,6 +18,9 @@
 - Fixed settle wait only (default `settle_sec=1.0`); no velocity gate in v1.
 - Default `min_samples=5`; do not save if fewer successful samples.
 - TF bridge frame names must match handeye launch `robot_base_frame` / `robot_effector_frame`.
+- **Only `RobotPoseSource` may call `FrankaInterface`, always under its lock.** The TF bridge timer reads the cache only. (`refresh_state_snapshot` shares queues with `reset_to_start_pose`, takes ≥ 0.25 s, and cannot run at 50 Hz.)
+- The handeye sampler reads TF at `now − 0.2 s`: after each move, refresh once and hold `tf_dwell_sec` (default 0.6) before `take_sample`.
+- Success of `take_sample` = sample-list length grew (the service returns the list either way).
 - Package name: `easy_handeye2_franka_auto`.
 - Vendor source: `/home/skand/connor/Continuous_Force_RL/real_robot_exps/`.
 
@@ -38,12 +41,16 @@ easy_handeye2_franka_auto/
     hybrid_controller.py
     mock_pylibfranka.py
     handeye_offsets.py
+    robot_pose_source.py
     handeye_tf_bridge.py
     handeye_auto_calibrate.py
   test/
     __init__.py
     test_handeye_offsets.py
     test_pose_helpers.py
+    test_robot_pose_source.py
+    test_tf_bridge_pose.py
+    test_auto_calibrate_logic.py
 ```
 
 ---
@@ -147,17 +154,21 @@ cp "$SRC/mock_pylibfranka.py" "$DST/"
 
 Copy robot section into `easy_handeye2_franka_auto/config/robot.yaml` from `$SRC/config.yaml` (keep `robot:` keys: `ip`, `use_mock`, `reset_duration_sec`, `NE_T_EE`, `EE_T_K`, etc.). Set `use_mock: true` in the committed default for safer first bring-up; operators override IP/`use_mock` locally.
 
-- [ ] **Step 4: Rewrite imports in vendored `pro_robot_interface.py`**
+- [ ] **Step 4: Rewrite `real_robot_exps` references in all vendored files**
 
-Replace every `real_robot_exps.` import with `easy_handeye2_franka_auto.`:
+The old module path appears at top level and inside nested imports (in `pro_robot_interface.py`: lines ~42, 196, 207, 820, 823, 1043, 1305; other files may have more). Do a global replace and verify none remain:
 
-| Old | New |
-|-----|-----|
-| `from real_robot_exps.robot_interface import` | `from easy_handeye2_franka_auto.robot_interface import` |
-| `from real_robot_exps.hybrid_controller import` | `from easy_handeye2_franka_auto.hybrid_controller import` |
-| `import real_robot_exps.mock_pylibfranka as plf` | `import easy_handeye2_franka_auto.mock_pylibfranka as plf` |
+```bash
+cd "$DST"
+sed -i 's/real_robot_exps\./easy_handeye2_franka_auto./g' robot_interface.py pro_robot_interface.py hybrid_controller.py mock_pylibfranka.py
+grep -n "real_robot_exps" *.py && echo "LEFTOVERS - fix manually" || echo "clean"
+```
 
-Apply in both top-level and nested `from ... import` inside `_comm_process_fn` / `_compute_process_fn` / gripper helpers (search the file for `real_robot_exps`).
+Expected: `clean`. Also check for path-based references (`Path(__file__)`, `sys.path` hacks, `config.yaml` relative loads) and fix them:
+
+```bash
+grep -n "__file__\|sys.path\|config.yaml" *.py
+```
 
 - [ ] **Step 5: Verify import without robot**
 
@@ -415,114 +426,238 @@ EOF
 
 ---
 
-### Task 3: TF bridge node
+### Task 3: Robot pose source (lock + cache)
 
 **Files:**
-- Create: `easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_tf_bridge.py`
-- Test: `easy_handeye2_franka_auto/test/test_tf_bridge_pose.py` (pure helper; no live robot)
+- Create: `easy_handeye2_franka_auto/easy_handeye2_franka_auto/robot_pose_source.py`
+- Test: `easy_handeye2_franka_auto/test/test_robot_pose_source.py`
 
 **Interfaces:**
-- Consumes: `FrankaInterface.refresh_state_snapshot()`, `get_state_snapshot()` → `ee_pos`, `ee_quat` (wxyz torch tensors)
+- Consumes: `FrankaInterface.refresh_state_snapshot()`, `get_state_snapshot()` (→ `ee_pos`, `ee_quat` wxyz; torch tensors or arrays), `reset_to_start_pose(T)`
 - Produces:
-  - `class RobotTfBridge(Node)` with constructor `(robot, base_frame: str, ee_frame: str, rate_hz: float = 50.0)`
-  - Timer callback refreshes state and publishes `TransformStamped` parent=`base_frame`, child=`ee_frame`
-  - `pose_msg_from_snapshot(snapshot) -> geometry_msgs.msg.Transform` helper for tests
+  - `class RobotPoseSource(robot)`
+  - `refresh() -> None` — under robot lock: refresh state, cache `(pos[3], quat_wxyz[4])` as numpy; on failure invalidate cache and re-raise
+  - `move_to(T_4x4) -> None` — under robot lock: **invalidate cache first**, then `reset_to_start_pose`; cache stays empty until the next `refresh()`
+  - `latest() -> Optional[tuple[np.ndarray, np.ndarray]]` — cached copy or `None`; uses a *separate* small cache lock so it never blocks behind a slow robot call
+  - `start_polling(hz)` / `stop_polling()` — optional background `refresh()` loop (free-drive TF); `stop_polling` joins the thread
+- Must not import `torch`, `rclpy`, or `pylibfranka` (unit-testable anywhere).
 
-- [ ] **Step 1: Write failing helper test**
+- [ ] **Step 1: Write failing tests**
 
 ```python
+import threading
+import time
 import numpy as np
 from types import SimpleNamespace
-import torch
-from easy_handeye2_franka_auto.handeye_tf_bridge import transform_from_snapshot
+from easy_handeye2_franka_auto.robot_pose_source import RobotPoseSource
 
 
-def test_transform_from_snapshot_translation():
-    snap = SimpleNamespace(
-        ee_pos=torch.tensor([0.1, 0.2, 0.3]),
-        ee_quat=torch.tensor([1.0, 0.0, 0.0, 0.0]),  # wxyz
-    )
-    t = transform_from_snapshot(snap)
-    assert abs(t.translation.x - 0.1) < 1e-6
-    assert abs(t.translation.y - 0.2) < 1e-6
-    assert abs(t.translation.z - 0.3) < 1e-6
-    assert abs(t.rotation.w - 1.0) < 1e-6
+class FakeRobot:
+    def __init__(self, pos=(0.1, 0.2, 0.3), quat=(1.0, 0.0, 0.0, 0.0), delay=0.0):
+        self.pos, self.quat, self.delay = np.array(pos), np.array(quat), delay
+        self.calls = []
+        self._active = 0
+        self.max_concurrent = 0
+        self._g = threading.Lock()
+
+    def _enter(self, name):
+        with self._g:
+            self._active += 1
+            self.max_concurrent = max(self.max_concurrent, self._active)
+            self.calls.append(name)
+        time.sleep(self.delay)
+        with self._g:
+            self._active -= 1
+
+    def refresh_state_snapshot(self):
+        self._enter("refresh")
+
+    def get_state_snapshot(self):
+        return SimpleNamespace(ee_pos=self.pos, ee_quat=self.quat)
+
+    def reset_to_start_pose(self, T):
+        self._enter("reset")
+        self.pos = np.asarray(T)[:3, 3].copy()
+
+
+def test_latest_none_before_refresh():
+    assert RobotPoseSource(FakeRobot()).latest() is None
+
+
+def test_refresh_populates_cache():
+    src = RobotPoseSource(FakeRobot())
+    src.refresh()
+    pos, quat = src.latest()
+    np.testing.assert_allclose(pos, [0.1, 0.2, 0.3])
+    np.testing.assert_allclose(quat, [1, 0, 0, 0])
+
+
+def test_move_invalidates_cache_until_refresh():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    src.refresh()
+    T = np.eye(4)
+    T[:3, 3] = [0.5, 0.0, 0.4]
+    src.move_to(T)
+    assert src.latest() is None
+    src.refresh()
+    np.testing.assert_allclose(src.latest()[0], [0.5, 0.0, 0.4])
+
+
+def test_failed_refresh_invalidates_and_raises():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    src.refresh()
+
+    def boom():
+        raise RuntimeError("boom")
+
+    robot.refresh_state_snapshot = boom
+    try:
+        src.refresh()
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert src.latest() is None
+
+
+def test_robot_calls_never_overlap_across_threads():
+    robot = FakeRobot(delay=0.02)
+    src = RobotPoseSource(robot)
+    T = np.eye(4)
+    threads = [threading.Thread(target=src.refresh) for _ in range(4)]
+    threads += [threading.Thread(target=src.move_to, args=(T,)) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert robot.max_concurrent == 1
+
+
+def test_latest_does_not_block_behind_robot_call():
+    robot = FakeRobot(delay=0.3)
+    src = RobotPoseSource(robot)
+    src.refresh()
+    t = threading.Thread(target=src.refresh)
+    t.start()
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    src.latest()
+    assert time.monotonic() - t0 < 0.1
+    t.join()
+
+
+def test_polling_refreshes_and_stops():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    src.start_polling(50.0)
+    time.sleep(0.15)
+    src.stop_polling()
+    n = robot.calls.count("refresh")
+    assert n >= 2
+    time.sleep(0.1)
+    assert robot.calls.count("refresh") == n
 ```
 
-- [ ] **Step 2: Run test — expect fail**
+- [ ] **Step 2: Run tests — expect fail (ModuleNotFoundError)**
 
 ```bash
-PYTHONPATH=$PWD pytest test/test_tf_bridge_pose.py -v
+cd /home/skand/connor/franka_ros2_ws/src/easy_handeye2/easy_handeye2_franka_auto
+PYTHONPATH=$PWD pytest test/test_robot_pose_source.py -v
 ```
 
-Expected: import failure.
-
-- [ ] **Step 3: Implement `handeye_tf_bridge.py`**
+- [ ] **Step 3: Implement `robot_pose_source.py`**
 
 ```python
-"""Publish robot base→EE tf from FrankaInterface snapshots."""
+"""Single owner of FrankaInterface calls, plus a cached EE pose for TF."""
 from __future__ import annotations
 
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import Transform, TransformStamped
-from tf2_ros import TransformBroadcaster
+import logging
+import threading
+from typing import Optional, Tuple
+
+import numpy as np
+
+_log = logging.getLogger(__name__)
 
 
-def transform_from_snapshot(snapshot) -> Transform:
-    pos = snapshot.ee_pos.detach().cpu().numpy().reshape(3)
-    quat = snapshot.ee_quat.detach().cpu().numpy().reshape(4)  # wxyz
-    t = Transform()
-    t.translation.x = float(pos[0])
-    t.translation.y = float(pos[1])
-    t.translation.z = float(pos[2])
-    t.rotation.w = float(quat[0])
-    t.rotation.x = float(quat[1])
-    t.rotation.y = float(quat[2])
-    t.rotation.z = float(quat[3])
-    return t
+def _to_numpy(x) -> np.ndarray:
+    if hasattr(x, "detach"):  # torch tensor
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=float).copy()
 
 
-class RobotTfBridge(Node):
-    def __init__(self, robot, base_frame: str, ee_frame: str, rate_hz: float = 50.0):
-        super().__init__('handeye_robot_tf_bridge')
+class RobotPoseSource:
+    def __init__(self, robot):
         self._robot = robot
-        self._base_frame = base_frame
-        self._ee_frame = ee_frame
-        self._br = TransformBroadcaster(self)
-        period = 1.0 / float(rate_hz)
-        self._timer = self.create_timer(period, self._on_timer)
+        self._robot_lock = threading.RLock()   # serializes ALL robot calls
+        self._cache_lock = threading.Lock()    # guards only the cache; never held during robot calls
+        self._latest: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self._poll_thread: Optional[threading.Thread] = None
+        self._poll_stop = threading.Event()
 
-    def _on_timer(self):
-        try:
-            self._robot.refresh_state_snapshot()
-            snap = self._robot.get_state_snapshot()
-        except Exception as exc:  # noqa: BLE001 — keep bridge alive during free-drive
-            self.get_logger().warn(f'TF bridge state refresh failed: {exc}')
+    def _set_cache(self, value):
+        with self._cache_lock:
+            self._latest = value
+
+    def latest(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        with self._cache_lock:
+            if self._latest is None:
+                return None
+            pos, quat = self._latest
+            return pos.copy(), quat.copy()
+
+    def refresh(self) -> None:
+        with self._robot_lock:
+            try:
+                self._robot.refresh_state_snapshot()
+                snap = self._robot.get_state_snapshot()
+                pos = _to_numpy(snap.ee_pos).reshape(3)
+                quat = _to_numpy(snap.ee_quat).reshape(4)  # wxyz
+            except Exception:
+                self._set_cache(None)
+                raise
+            self._set_cache((pos, quat))
+
+    def move_to(self, target_pose_4x4: np.ndarray) -> None:
+        with self._robot_lock:
+            self._set_cache(None)  # pose is unknown until the next refresh()
+            self._robot.reset_to_start_pose(np.asarray(target_pose_4x4, dtype=float))
+
+    def start_polling(self, hz: float) -> None:
+        if self._poll_thread is not None or hz <= 0:
             return
-        msg = TransformStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self._base_frame
-        msg.child_frame_id = self._ee_frame
-        msg.transform = transform_from_snapshot(snap)
-        self._br.sendTransform(msg)
+        self._poll_stop.clear()
+
+        def _loop():
+            while not self._poll_stop.wait(1.0 / hz):
+                try:
+                    self.refresh()
+                except Exception as exc:  # noqa: BLE001 — keep polling during free-drive
+                    _log.warning("pose poll failed: %s", exc)
+
+        self._poll_thread = threading.Thread(target=_loop, daemon=True)
+        self._poll_thread.start()
+
+    def stop_polling(self) -> None:
+        if self._poll_thread is None:
+            return
+        self._poll_stop.set()
+        self._poll_thread.join()
+        self._poll_thread = None
 ```
 
-- [ ] **Step 4: Run helper test — expect pass**
+- [ ] **Step 4: Run tests — expect pass**
 
 ```bash
-PYTHONPATH=$PWD pytest test/test_tf_bridge_pose.py -v
+PYTHONPATH=$PWD pytest test/test_robot_pose_source.py -v
 ```
-
-Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_tf_bridge.py \
-        easy_handeye2_franka_auto/test/test_tf_bridge_pose.py
+git add easy_handeye2_franka_auto/easy_handeye2_franka_auto/robot_pose_source.py \
+        easy_handeye2_franka_auto/test/test_robot_pose_source.py
 git commit -m "$(cat <<'EOF'
-Add Franka snapshot to robot TF bridge for hand-eye sampling.
+Add lock-guarded robot pose source with cached EE pose.
 
 EOF
 )"
@@ -530,29 +665,128 @@ EOF
 
 ---
 
-### Task 4: Auto-calibrate CLI loop
+### Task 4: TF bridge node (cache-only)
+
+**Files:**
+- Create: `easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_tf_bridge.py`
+- Test: `easy_handeye2_franka_auto/test/test_tf_bridge_pose.py`
+
+**Interfaces:**
+- Consumes: `RobotPoseSource.latest()`
+- Produces:
+  - `transform_from_pose(pos, quat_wxyz) -> geometry_msgs.msg.Transform`
+  - `class RobotTfBridge(Node)` with constructor `(pose_source, base_frame: str, ee_frame: str, rate_hz: float = 30.0)`; timer publishes `base_frame → ee_frame` stamped `now` **only if** `latest()` is not `None`; **never calls the robot**
+
+Requires a sourced ROS 2 environment (`rclpy`, `geometry_msgs`, `tf2_ros`).
+
+- [ ] **Step 1: Write failing test**
+
+```python
+import numpy as np
+from easy_handeye2_franka_auto.handeye_tf_bridge import transform_from_pose
+
+
+def test_transform_from_pose_maps_wxyz_to_xyzw_fields():
+    t = transform_from_pose(np.array([0.1, 0.2, 0.3]), np.array([0.5, 0.1, 0.2, 0.3]))
+    assert abs(t.translation.x - 0.1) < 1e-9
+    assert abs(t.translation.y - 0.2) < 1e-9
+    assert abs(t.translation.z - 0.3) < 1e-9
+    assert abs(t.rotation.w - 0.5) < 1e-9
+    assert abs(t.rotation.x - 0.1) < 1e-9
+    assert abs(t.rotation.y - 0.2) < 1e-9
+    assert abs(t.rotation.z - 0.3) < 1e-9
+```
+
+- [ ] **Step 2: Run test — expect fail**
+
+```bash
+source /opt/ros/$ROS_DISTRO/setup.bash
+PYTHONPATH=$PWD pytest test/test_tf_bridge_pose.py -v
+```
+
+- [ ] **Step 3: Implement `handeye_tf_bridge.py`**
+
+```python
+"""Publish the cached robot base→EE pose to /tf. Never touches the robot."""
+from __future__ import annotations
+
+from geometry_msgs.msg import Transform, TransformStamped
+from rclpy.node import Node
+from tf2_ros import TransformBroadcaster
+
+
+def transform_from_pose(pos, quat_wxyz) -> Transform:
+    t = Transform()
+    t.translation.x, t.translation.y, t.translation.z = (float(v) for v in pos)
+    t.rotation.w = float(quat_wxyz[0])
+    t.rotation.x = float(quat_wxyz[1])
+    t.rotation.y = float(quat_wxyz[2])
+    t.rotation.z = float(quat_wxyz[3])
+    return t
+
+
+class RobotTfBridge(Node):
+    def __init__(self, pose_source, base_frame: str, ee_frame: str, rate_hz: float = 30.0):
+        super().__init__('handeye_robot_tf_bridge')
+        self._source = pose_source
+        self._base_frame = base_frame
+        self._ee_frame = ee_frame
+        self._br = TransformBroadcaster(self)
+        self._timer = self.create_timer(1.0 / float(rate_hz), self._on_timer)
+
+    def _on_timer(self):
+        latest = self._source.latest()
+        if latest is None:  # before first refresh, or while moving: publish nothing
+            return
+        pos, quat = latest
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self._base_frame
+        msg.child_frame_id = self._ee_frame
+        msg.transform = transform_from_pose(pos, quat)
+        self._br.sendTransform(msg)
+```
+
+- [ ] **Step 4: Run test — expect pass**
+
+```bash
+PYTHONPATH=$PWD pytest test/test_tf_bridge_pose.py -v
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_tf_bridge.py \
+        easy_handeye2_franka_auto/test/test_tf_bridge_pose.py
+git commit -m "$(cat <<'EOF'
+Add cache-only robot TF bridge for hand-eye sampling.
+
+EOF
+)"
+```
+
+---
+
+### Task 5: Auto-calibrate CLI loop
 
 **Files:**
 - Create: `easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_auto_calibrate.py`
 - Modify: `easy_handeye2_franka_auto/README.md` (usage)
-- Test: `easy_handeye2_franka_auto/test/test_auto_calibrate_logic.py` (pure helpers: skip/save gating)
+- Test: `easy_handeye2_franka_auto/test/test_auto_calibrate_logic.py`
 
 **Interfaces:**
-- Consumes:
-  - `FrankaInterface(config, device="cpu")`
-  - `compute_poses_around_state`, `snapshot_to_pose_4x4`
-  - `RobotTfBridge`
-  - `easy_handeye2.handeye_client.HandeyeClient`
-  - `easy_handeye2_msgs.msg.HandeyeCalibrationParameters`
-- Produces: console script `handeye_auto_calibrate` implementing the design runtime loop
-- Helpers for tests:
-  - `should_save(num_success: int, min_samples: int) -> bool`
-  - `sample_ok(current_transforms) -> bool` — True iff transforms object is not None
+- Consumes: `FrankaInterface(config, device="cpu")` (imported lazily inside `main`), `RobotPoseSource`, `RobotTfBridge`, `compute_poses_around_state`, `snapshot_to_pose_4x4`, `easy_handeye2.handeye_client.HandeyeClient`, `easy_handeye2_msgs.msg.HandeyeCalibrationParameters` (valid import; `easy_handeye2.handeye_calibration` re-exports it)
+- Produces: console script `handeye_auto_calibrate`
+- Pure helpers (unit-tested; module top level imports stdlib only, so tests need no ROS/robot stack):
+  - `should_save(num_samples: int, min_samples: int) -> bool` — `num_samples >= max(min_samples, 3)` (compute needs > 2 samples)
+  - `sample_added(n_before: int, n_after: int) -> bool`
 
-- [ ] **Step 1: Write failing gating tests**
+Service facts (verified against the repo): `take_sample` returns the sample list whether or not a sample was appended; `compute_calibration` returns `.valid` / `.calibration`; `save` returns `.success`; the client needs the `handeye_server` from `calibrate.launch.py` already running (its constructor blocks on `wait_for_service`).
+
+- [ ] **Step 1: Write failing tests**
 
 ```python
-from easy_handeye2_franka_auto.handeye_auto_calibrate import should_save, sample_ok
+from easy_handeye2_franka_auto.handeye_auto_calibrate import should_save, sample_added
 
 
 def test_should_save_requires_min_samples():
@@ -560,9 +794,14 @@ def test_should_save_requires_min_samples():
     assert should_save(4, 5) is False
 
 
-def test_sample_ok_none_is_false():
-    assert sample_ok(None) is False
-    assert sample_ok(object()) is True
+def test_should_save_never_below_three():
+    assert should_save(2, 1) is False
+    assert should_save(3, 1) is True
+
+
+def test_sample_added_detects_list_growth():
+    assert sample_added(0, 1) is True
+    assert sample_added(3, 3) is False
 ```
 
 - [ ] **Step 2: Run — expect fail**
@@ -573,142 +812,156 @@ PYTHONPATH=$PWD pytest test/test_auto_calibrate_logic.py -v
 
 - [ ] **Step 3: Implement `handeye_auto_calibrate.py`**
 
-Core structure (full file in package; keep helpers at module top):
-
 ```python
 """CLI: free-drive home → A-style offsets → take_sample → compute/save."""
 from __future__ import annotations
 
 import argparse
 import math
+import sys
+import threading
 import time
 from pathlib import Path
 
-import numpy as np
-import rclpy
-import yaml
-from easy_handeye2.handeye_client import HandeyeClient
-from easy_handeye2_msgs.msg import HandeyeCalibrationParameters
-from rclpy.executors import MultiThreadedExecutor
 
-from easy_handeye2_franka_auto.handeye_offsets import (
-    compute_poses_around_state,
-    snapshot_to_pose_4x4,
-)
-from easy_handeye2_franka_auto.handeye_tf_bridge import RobotTfBridge
-from easy_handeye2_franka_auto.pro_robot_interface import FrankaInterface
+def should_save(num_samples: int, min_samples: int) -> bool:
+    return num_samples >= max(min_samples, 3)
 
 
-def should_save(num_success: int, min_samples: int) -> bool:
-    return num_success >= min_samples
+def sample_added(n_before: int, n_after: int) -> bool:
+    return n_after > n_before
 
 
-def sample_ok(current_transforms) -> bool:
-    return current_transforms is not None
-
-
-def _parse_args():
+def _parse_args(argv):
     p = argparse.ArgumentParser(description='Automated eye-on-base hand-eye sampling')
     p.add_argument('--robot-config', type=Path, required=True)
-    p.add_argument('--name', required=True, help='easy_handeye2 calibration name')
+    p.add_argument('--name', required=True, help='easy_handeye2 calibration name (must match calibrate launch)')
     p.add_argument('--robot-base-frame', required=True)
     p.add_argument('--robot-effector-frame', required=True)
     p.add_argument('--rotation-delta-degrees', type=float, default=25.0)
     p.add_argument('--translation-delta-meters', type=float, default=0.1)
     p.add_argument('--settle-sec', type=float, default=1.0)
-    p.add_argument('--tf-rate-hz', type=float, default=50.0)
+    p.add_argument('--tf-dwell-sec', type=float, default=0.6,
+                   help='hold after refresh so TF covers the sampler 0.2 s lookback')
+    p.add_argument('--tf-rate-hz', type=float, default=30.0)
+    p.add_argument('--freedrive-poll-hz', type=float, default=0.0,
+                   help='>0 polls robot state during free-drive (unverified on hardware; keep <=2)')
     p.add_argument('--min-samples', type=int, default=5)
+    p.add_argument('--first-n', type=int, default=0, help='only run the first N offset poses (0 = all)')
+    p.add_argument('--keep-existing-samples', action='store_true')
     p.add_argument('--return-home', action='store_true')
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def main(args=None):
-    cli = _parse_args()
+    import rclpy
+    import yaml
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.utilities import remove_ros_args
+
+    from easy_handeye2.handeye_client import HandeyeClient
+    from easy_handeye2_msgs.msg import HandeyeCalibrationParameters
+    from easy_handeye2_franka_auto.handeye_offsets import (
+        compute_poses_around_state,
+        snapshot_to_pose_4x4,
+    )
+    from easy_handeye2_franka_auto.handeye_tf_bridge import RobotTfBridge
+    from easy_handeye2_franka_auto.robot_pose_source import RobotPoseSource
+
+    cli = _parse_args(remove_ros_args(args=sys.argv)[1:])
     with open(cli.robot_config) as f:
         robot_cfg = yaml.safe_load(f)
 
     rclpy.init(args=args)
-    robot = FrankaInterface(robot_cfg, device='cpu')
-
     node = rclpy.create_node('handeye_auto_calibrate')
-    params = HandeyeCalibrationParameters(
-        name=cli.name,
-        calibration_type='eye_on_base',
-        robot_base_frame=cli.robot_base_frame,
-        robot_effector_frame=cli.robot_effector_frame,
-        tracking_base_frame='',
-        tracking_marker_frame='',
-        freehand_robot_movement=True,
-    )
-    client = HandeyeClient(node, params)
-    bridge = RobotTfBridge(
-        robot,
-        base_frame=cli.robot_base_frame,
-        ee_frame=cli.robot_effector_frame,
-        rate_hz=cli.tf_rate_hz,
-    )
-
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
-    executor.add_node(bridge)
-
-    # Spin executor in background thread so service calls + tf timer work
-    import threading
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
-    spin_thread.start()
-
-    success = 0
+    log = node.get_logger()
+    robot = source = bridge = executor = None
     try:
+        from easy_handeye2_franka_auto.pro_robot_interface import FrankaInterface  # heavy: torch, pylibfranka
+
+        robot = FrankaInterface(robot_cfg, device='cpu')
+        source = RobotPoseSource(robot)
+        bridge = RobotTfBridge(source, cli.robot_base_frame, cli.robot_effector_frame, cli.tf_rate_hz)
+
+        executor = MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.add_node(bridge)
+        threading.Thread(target=executor.spin, daemon=True).start()  # needed for sync service calls
+
+        params = HandeyeCalibrationParameters(
+            name=cli.name,
+            calibration_type='eye_on_base',
+            robot_base_frame=cli.robot_base_frame,
+            robot_effector_frame=cli.robot_effector_frame,
+            freehand_robot_movement=True,
+        )
+        client = HandeyeClient(node, params)  # blocks until handeye_server services are up
+
+        def n_samples() -> int:
+            return len(client.get_sample_list().samples)
+
+        existing = n_samples()
+        if existing and not cli.keep_existing_samples:
+            log.warn(f'Removing {existing} pre-existing samples (use --keep-existing-samples to keep)')
+            while n_samples():
+                client.remove_sample(0)
+
+        source.start_polling(cli.freedrive_poll_hz)
         input('Free-drive marker into camera center, then press Enter...')
-        robot.refresh_state_snapshot()
-        snap = robot.get_state_snapshot()
-        home = snapshot_to_pose_4x4(
-            snap.ee_pos.detach().cpu().numpy(),
-            snap.ee_quat.detach().cpu().numpy(),
-        )
+        source.stop_polling()
+
+        source.refresh()
+        pos, quat = source.latest()
+        home = snapshot_to_pose_4x4(pos, quat)
         targets = compute_poses_around_state(
-            home,
-            math.radians(cli.rotation_delta_degrees),
-            cli.translation_delta_meters,
-        )
-        node.get_logger().info(f'Home captured; running {len(targets)} offset poses')
+            home, math.radians(cli.rotation_delta_degrees), cli.translation_delta_meters)
+        if cli.first_n > 0:
+            targets = targets[:cli.first_n]
+        log.info(f'Home captured; running {len(targets)} offset poses')
 
+        motion_fault = False
         for i, T in enumerate(targets):
-            node.get_logger().info(f'Moving to pose {i}/{len(targets) - 1}')
+            log.info(f'Pose {i + 1}/{len(targets)}')
             try:
-                robot.reset_to_start_pose(T)
-            except Exception as exc:
-                node.get_logger().error(f'Motion failed at pose {i}: {exc}')
+                source.move_to(T)
+                time.sleep(cli.settle_sec)
+                source.refresh()               # measured pose; bridge resumes publishing it
+                time.sleep(cli.tf_dwell_sec)   # TF must hold the new pose across the sampler lookback
+            except Exception as exc:  # noqa: BLE001
+                log.error(f'Motion/state failure at pose index {i}: {exc}')
+                motion_fault = True
                 break
-            time.sleep(cli.settle_sec)
-            # Ensure TF is fresh for sampler
-            robot.refresh_state_snapshot()
-            current = client.get_current_transforms()
-            if not sample_ok(current):
-                node.get_logger().warn(f'Skipping pose {i}: missing transforms')
-                continue
+            before = n_samples()
             client.take_sample()
-            success += 1
-            node.get_logger().info(f'Sample ok ({success} total)')
+            if sample_added(before, n_samples()):
+                log.info(f'Sample ok ({n_samples()} total)')
+            else:
+                log.warn(f'Skipping pose {i}: sample not recorded (missing/extrapolating TF?)')
 
-        if should_save(success, cli.min_samples):
+        total = n_samples()
+        if motion_fault:
+            log.error(f'Aborted after motion fault; NOT computing/saving. {total} samples remain on the server.')
+        elif should_save(total, cli.min_samples):
             result = client.compute_calibration()
             if result.valid:
-                client.save()
-                node.get_logger().info(f'Saved calibration ({success} samples)')
+                saved = client.save()
+                log.info(f'Saved calibration ({total} samples): success={saved.success}')
             else:
-                node.get_logger().error('compute_calibration returned invalid; not saving')
+                log.error('compute_calibration returned valid=false; not saving')
         else:
-            node.get_logger().error(
-                f'Not saving: only {success} samples (need >= {cli.min_samples})'
-            )
+            log.error(f'Not saving: only {total} samples (need >= {max(cli.min_samples, 3)})')
 
-        if cli.return_home:
-            robot.reset_to_start_pose(home)
+        if cli.return_home and not motion_fault:
+            source.move_to(home)
     finally:
-        robot.shutdown()
-        executor.shutdown()
-        bridge.destroy_node()
+        if source is not None:
+            source.stop_polling()
+        if robot is not None:
+            robot.shutdown()
+        if executor is not None:
+            executor.shutdown()
+        if bridge is not None:
+            bridge.destroy_node()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
@@ -717,8 +970,6 @@ def main(args=None):
 if __name__ == '__main__':
     main()
 ```
-
-**Important:** `compute_calibration()` returns a response with `.valid` (see `handeye_rqt_calibrator_widget.handle_compute_calibration`). Only call `save()` when `result.valid` is True.
 
 - [ ] **Step 4: Run gating tests — expect pass**
 
@@ -730,13 +981,13 @@ PYTHONPATH=$PWD pytest test/test_auto_calibrate_logic.py -v
 
 Document:
 
-1. Start camera/marker + `calibrate.launch.py` with matching frames and `name`, freehand movement.
-2. Ensure `franka_ros2` control is **not** connected.
+1. Start camera/marker + `calibrate.launch.py` with `calibration_type:=eye_on_base`, `freehand_robot_movement:=true`, and robot/tracking frames + `name` matching the CLI.
+2. Ensure `franka_ros2` control is **not** connected (pylibfranka is the sole robot client).
 3. Build/source workspace.
-4. Run:
+4. Run (no `--` separator; `ros2 run` forwards args directly):
 
 ```bash
-ros2 run easy_handeye2_franka_auto handeye_auto_calibrate -- \
+ros2 run easy_handeye2_franka_auto handeye_auto_calibrate \
   --robot-config $(ros2 pkg prefix easy_handeye2_franka_auto)/share/easy_handeye2_franka_auto/config/robot.yaml \
   --name my_eob_calib \
   --robot-base-frame fr3_link0 \
@@ -744,7 +995,7 @@ ros2 run easy_handeye2_franka_auto handeye_auto_calibrate -- \
   --return-home
 ```
 
-(Adjust frame names to the operator’s setup.)
+(Adjust frame names to the operator's setup.) Explain `--first-n 1` for first bring-up, `--tf-dwell-sec`, and that pre-existing samples are cleared unless `--keep-existing-samples`.
 
 - [ ] **Step 6: Commit**
 
@@ -753,7 +1004,7 @@ git add easy_handeye2_franka_auto/easy_handeye2_franka_auto/handeye_auto_calibra
         easy_handeye2_franka_auto/test/test_auto_calibrate_logic.py \
         easy_handeye2_franka_auto/README.md
 git commit -m "$(cat <<'EOF'
-Add automated hand-eye calibrate loop using pylibfranka and TF bridge.
+Add automated hand-eye calibrate loop using pylibfranka and cached TF bridge.
 
 EOF
 )"
@@ -761,14 +1012,14 @@ EOF
 
 ---
 
-### Task 5: Build + manual integration checklist
+### Task 6: Build + manual integration checklist
 
 **Files:**
 - Modify: `easy_handeye2_franka_auto/README.md` (checklist section)
 - No new production code unless build reveals import gaps
 
 **Interfaces:**
-- Consumes: Tasks 1–4 deliverables
+- Consumes: Tasks 1–5 deliverables
 - Produces: verified install + documented manual test results (operator-run)
 
 - [ ] **Step 1: Build package**
@@ -796,10 +1047,10 @@ Expected: all PASS.
 
 Append to README and execute when hardware available:
 
-1. **TF only:** `use_mock: false`, start bridge via auto script up to free-drive prompt; `ros2 run tf2_ros tf2_echo <base> <ee>` updates while jogging in freedrive / after Enter refresh.
-2. **Single pose:** temporarily limit targets to first pose (or Ctrl+C after one) and confirm one sample appears in handeye sample list / logs.
+1. **Free-drive + state read:** `use_mock: false`; run the script to the free-drive prompt. Hand-guide, press Enter, confirm `refresh()` succeeds and `ros2 run tf2_ros tf2_echo <base> <ee>` shows the pose. Separately try `--freedrive-poll-hz 1` and record whether hand-guiding still works while polling (open question in the spec); if not, leave it at 0 and note it in the README.
+2. **Single pose:** `--first-n 1`; confirm one move, sample-list length 1, and no "sample not recorded" warning. Also try `--tf-dwell-sec 0.1` once to confirm the dwell matters (expect an occasional skipped sample or a visibly off pose), then restore the default.
 3. **Full run:** complete offsets → compute → save under `~/.ros2/easy_handeye2/calibrations/`.
-4. **Publish:** `publish.launch.py` with same `name` shows calibrated transform.
+4. **Publish:** `publish.launch.py` with the same `name` shows the calibrated transform.
 
 - [ ] **Step 4: Commit README checklist updates**
 
@@ -818,17 +1069,21 @@ EOF
 
 | Spec requirement | Task |
 |------------------|------|
-| Eye-on-base, free-drive then A-style offsets | Task 2 + 4 |
 | Vendored full PRO interface (Option 1) | Task 1 |
-| TF bridge while pylibfranka owns robot | Task 3 + 4 |
-| Auto take_sample / compute / save | Task 4 |
-| Skip missing TF; abort on motion fault; min_samples gate | Task 4 |
+| Eye-on-base, free-drive then A-style offsets | Task 2 + 5 |
+| Single robot owner + lock + cached pose | Task 3 |
+| TF bridge while pylibfranka owns robot (cache-only) | Task 4 |
+| Post-refresh TF dwell for sampler 0.2 s lookback | Task 5 |
+| Auto take_sample (success = list growth) / compute (`.valid`) / save | Task 5 |
+| Skip missing TF; abort on motion fault; min_samples gate; clear stale samples | Task 5 |
 | No MoveIt / no franka_ros2 control during run | README + Global Constraints |
 | Package `easy_handeye2_franka_auto` | Task 1 |
-| Manual TF / single / full / publish tests | Task 5 |
+| Manual free-drive/state, single, full, publish tests | Task 6 |
 
-## Placeholder / consistency notes
+## Notes and known gaps
 
-- `HandeyeCalibrationParameters` unused tracking frames are left empty; sampler uses whatever the running `handeye_server` was launched with — **operator must launch calibrate with the same `name` and robot frames as CLI**.
-- Quaternion convention throughout: **wxyz** from `FrankaInterface`; TF `geometry_msgs` uses **xyzw** fields filled from wxyz components as shown in Task 3.
-- Euler convention for offset deltas matches `handeye_robot` (XYZ half-angles via quat multiply on the right of home orientation).
+- `HandeyeCalibrationParameters` tracking frames are left empty in the client; the sampler uses whatever the running `handeye_server` was launched with — **operator must launch calibrate with the same robot frames and `eye_on_base`**. (`name` only affects sample/calibration file naming on the server; service topics are absolute `/easy_handeye2/calibration/*`.)
+- Quaternion convention: **wxyz** from `FrankaInterface`; `geometry_msgs` uses xyzw fields filled from wxyz components in `transform_from_pose`.
+- Offset math verified against `handeye_robot._compute_poses_around_state`: 12 rotations (± about X/Y/Z at `angle_delta`, then `angle_delta/2`, interleaved) then 5 translations; delta quaternion is right-multiplied onto the home orientation (rotation in the EE frame). Single-axis rotations make the euler-order convention irrelevant.
+- No reachability precheck (the MoveIt helper had `_check_target_poses`). Unreachable targets surface as a `reset_to_start_pose` failure; use `--first-n` and modest deltas.
+- Whether `refresh_state_snapshot()` works during hand-guiding is unverified; polling is opt-in until manual test 1 passes.
