@@ -16,7 +16,22 @@ Design: `docs/superpowers/specs/2026-09-21-franka-auto-handeye-design.md`
    must be the sole FCI client.
 3. Build and source this workspace.
 
-## Run
+## Motion-only smoke test (no camera / handeye)
+
+Ensure `franka_ros2` control is off. Set `use_mock: false` and the robot IP in
+`config/robot.yaml`, rebuild/source, then:
+
+```bash
+ros2 run easy_handeye2_franka_auto handeye_motion_test \
+  --robot-config $(ros2 pkg prefix easy_handeye2_franka_auto)/share/easy_handeye2_franka_auto/config/robot.yaml \
+  --first-n 3 \
+  --rotation-delta-degrees 15 \
+  --translation-delta-meters 0.05
+```
+
+Free-drive to a safe pose, press Enter; it runs the first N offsets and returns home.
+
+## Full auto-calibrate
 
 ```bash
 ros2 run easy_handeye2_franka_auto handeye_auto_calibrate \

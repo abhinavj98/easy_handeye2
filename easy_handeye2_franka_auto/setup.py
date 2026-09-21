@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'handeye_auto_calibrate = easy_handeye2_franka_auto.handeye_auto_calibrate:main',
+            'handeye_motion_test = easy_handeye2_franka_auto.handeye_motion_test:main',
         ],
     },
 )
