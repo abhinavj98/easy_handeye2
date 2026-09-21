@@ -47,29 +47,8 @@ def main(args=None):
 
     robot = FrankaInterface(robot_cfg, device='cpu')
     source = RobotPoseSource(robot)
-
-    def _move(label: str, T) -> None:
-        try:
-            source.move_to(T)
-        except RuntimeError as exc:
-            if 'reflex' not in str(exc).lower():
-                raise
-            print(f'{label}: reflex — running error_recovery and retrying once')
-            robot.error_recovery()
-            time.sleep(0.5)
-            source.move_to(T)
-
     try:
-        input(
-            'Free-drive to a safe start pose, RELEASE guiding/freedrive, '
-            'let the arm settle, then press Enter...'
-        )
-        try:
-            robot.error_recovery()
-        except Exception as exc:  # noqa: BLE001
-            print(f'error_recovery before motion (ok to ignore if clean): {exc}')
-        time.sleep(0.5)
-
+        input('Free-drive to a safe start pose, then press Enter...')
         source.refresh()
         latest = source.latest()
         if latest is None:
@@ -90,12 +69,12 @@ def main(args=None):
 
         for i, T in enumerate(targets):
             print(f'Pose {i + 1}/{len(targets)}')
-            _move(f'Pose {i + 1}', T)
+            source.move_to(T)
             time.sleep(cli.settle_sec)
 
         if cli.return_home:
             print('Returning home')
-            _move('Return home', home)
+            source.move_to(home)
         print('Motion test done')
     finally:
         robot.shutdown()

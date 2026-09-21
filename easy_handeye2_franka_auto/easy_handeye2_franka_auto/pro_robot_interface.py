@@ -293,58 +293,33 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                     start_q = _rotation_matrix_to_quat_wxyz_np(start_R)
                     target_q = _rotation_matrix_to_quat_wxyz_np(target_R)
 
-                    def _pose_flat(R, t):
-                        return [
-                            R[0, 0], R[1, 0], R[2, 0], 0.0,
-                            R[0, 1], R[1, 1], R[2, 1], 0.0,
-                            R[0, 2], R[1, 2], R[2, 2], 0.0,
-                            float(t[0]), float(t[1]), float(t[2]), 1.0,
-                        ]
-
-                    def _quintic(t: float) -> float:
-                        # Zero vel AND zero accel at endpoints. Cosine ease
-                        # only zeros velocity; Franka treats the leftover
-                        # acceleration jump as cartesian_*_discontinuity.
-                        return t * t * t * (10.0 - 15.0 * t + 6.0 * t * t)
-
-                    # Hold current pose before ramping (raw O_T_EE encoding).
-                    hold_sec = float(robot_cfg.get('reset_hold_sec', 0.5))
-                    hold_steps = max(int(hold_sec * 1000), 1)
-                    n_steps = max(int(reset_duration_sec * 1000), 1)
-
+                    n_steps = int(reset_duration_sec * 1000)
                     import gc
                     gc.disable()
                     try:
-                        for _ in range(hold_steps):
-                            pose_cmd = CartesianPose(initial_pose)
-                            ctrl.writeOnce(pose_cmd)
-                            state, _ = ctrl.readOnce()
-                            initial_pose = state.O_T_EE
+                        for i in range(n_steps):
+                            if i == 0:
+                                # 3. CRITICAL: Step 0 MUST be the exact, unmodified initial_pose 
+                                # to prevent floating-point velocity discontinuities.
+                                pose_cmd = CartesianPose(initial_pose)
+                                ctrl.writeOnce(pose_cmd)
+                                state, _ = ctrl.readOnce()
+                                continue
 
-                        # Re-base interpolation on the held pose.
-                        start_flat = np.array(state.O_T_EE)
-                        start_R = np.array([
-                            [start_flat[0], start_flat[4], start_flat[8]],
-                            [start_flat[1], start_flat[5], start_flat[9]],
-                            [start_flat[2], start_flat[6], start_flat[10]],
-                        ])
-                        start_t = start_flat[12:15].copy()
-                        start_q = _rotation_matrix_to_quat_wxyz_np(start_R)
+                            alpha = 0.5 * (1.0 - math.cos(math.pi * (i + 1) / n_steps))
+                            interp_t = (1.0 - alpha) * start_t + alpha * target_t
+                            interp_q = _quat_slerp(start_q, target_q, alpha)
+                            interp_R = _quat_wxyz_to_rotation_matrix_np(interp_q)
 
-                        for i in range(1, n_steps + 1):
-                            alpha = _quintic(i / n_steps)
-                            # Keep bit-exact start encoding until the profile
-                            # actually moves — reconstructing R from quat(R)
-                            # is not identical to O_T_EE and trips discontinuity.
-                            if alpha < 1e-9:
-                                pose_list = start_flat.tolist()
-                            else:
-                                interp_t = (1.0 - alpha) * start_t + alpha * target_t
-                                interp_q = _quat_slerp(start_q, target_q, alpha)
-                                interp_R = _quat_wxyz_to_rotation_matrix_np(interp_q)
-                                pose_list = _pose_flat(interp_R, interp_t)
-                            pose_cmd = CartesianPose(pose_list)
-                            if i == n_steps:
+                            interp_flat = np.array([
+                                interp_R[0, 0], interp_R[1, 0], interp_R[2, 0], 0.0,
+                                interp_R[0, 1], interp_R[1, 1], interp_R[2, 1], 0.0,
+                                interp_R[0, 2], interp_R[1, 2], interp_R[2, 2], 0.0,
+                                interp_t[0], interp_t[1], interp_t[2], 1.0,
+                            ])
+
+                            pose_cmd = CartesianPose(interp_flat.tolist())
+                            if i == n_steps - 1:
                                 pose_cmd.motion_finished = True
                                 ctrl.writeOnce(pose_cmd)
                                 break
