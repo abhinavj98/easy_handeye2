@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-import time
 from pathlib import Path
 
 
@@ -18,8 +17,13 @@ def _parse_args(argv):
     p.add_argument('--translation-delta-meters', type=float, default=0.05,
                    help='translation magnitude for offsets (default 0.05)')
     p.add_argument('--settle-sec', type=float, default=1.0)
+    p.add_argument('--tf-dwell-sec', type=float, default=0.6,
+                   help='hold after refresh (same as handeye_auto_calibrate)')
     p.add_argument('--first-n', type=int, default=3,
-                   help='only run the first N offset poses (0 = all 17; default 3)')
+                   help='only run the first N offset poses (0 = all; default 3). '
+                        'Note: poses 1-12 are EE rotations; 13-17 are base translations.')
+    p.add_argument('--translations-only', action='store_true',
+                   help='skip EE rotations; only run base-frame translation offsets')
     p.add_argument('--return-home', action='store_true', default=True,
                    help='return to free-drive home after offsets (default on)')
     p.add_argument('--no-return-home', action='store_false', dest='return_home')
@@ -61,6 +65,12 @@ def main(args=None):
             math.radians(cli.rotation_delta_degrees),
             cli.translation_delta_meters,
         )
+        # Pose layout: [12 EE rotations] + [5 base translations].
+        # With rotation_delta=0 the first 12 are identical to home — skip them
+        # unless the user explicitly wants that no-op list.
+        if cli.translations_only or abs(cli.rotation_delta_degrees) < 1e-9:
+            targets = targets[12:]
+            print('Using translation offsets only (base ±X/±Y/+Z)')
         if cli.first_n > 0:
             targets = targets[:cli.first_n]
         print(f'Home captured; running {len(targets)} offset poses '
@@ -69,12 +79,15 @@ def main(args=None):
 
         for i, T in enumerate(targets):
             print(f'Pose {i + 1}/{len(targets)}')
-            source.move_to(T)
-            time.sleep(cli.settle_sec)
+            try:
+                source.go_to(T, cli.settle_sec, cli.tf_dwell_sec)
+            except Exception as exc:  # noqa: BLE001
+                print(f'Motion/state failure at pose index {i}: {exc}')
+                return
 
         if cli.return_home:
             print('Returning home')
-            source.move_to(home)
+            source.go_to(home, cli.settle_sec, cli.tf_dwell_sec)
         print('Motion test done')
     finally:
         robot.shutdown()
