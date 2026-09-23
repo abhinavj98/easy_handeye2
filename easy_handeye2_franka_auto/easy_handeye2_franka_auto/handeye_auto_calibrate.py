@@ -89,6 +89,17 @@ def main(args=None):
         executor.add_node(bridge)
         threading.Thread(target=executor.spin, daemon=True).start()
 
+        # Prime the pose cache before waiting on the handeye services, otherwise the
+        # two sides deadlock: handeye_server only advertises its services once
+        # robot_base_frame -> robot_effector_frame is in tf (see
+        # handeye_server.setup_services_and_topics), and the bridge only publishes
+        # that once the cache is non-empty. Reading state does not move the robot.
+        log.info('Reading initial robot pose so tf is live for handeye_server...')
+        source.refresh()
+        log.info(f'Publishing {cli.robot_base_frame} -> {cli.robot_effector_frame} at '
+                 f'{cli.tf_rate_hz} Hz; waiting for handeye services '
+                 f'(needs calibrate.launch.py with name:={cli.name} and matching frames)')
+
         params = HandeyeCalibrationParameters(
             name=cli.name,
             calibration_type='eye_on_base',
