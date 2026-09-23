@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import random
 from itertools import product
-from typing import List
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -117,3 +117,36 @@ def compute_cube_poses(
         raise ValueError(f'n_poses must be in 1..{len(pool)}, got {n_poses}')
     rng = random.Random(seed)
     return rng.sample(pool, n_poses)
+
+
+def pose_distance(T_a: np.ndarray, T_b: np.ndarray) -> Tuple[float, float]:
+    """(translation_m, rotation_rad) between two 4x4 poses.
+
+    Rotation is the angle of R_a^T R_b (axis-angle magnitude), via the trace
+    identity: trace(R) = 1 + 2*cos(theta).
+    """
+    T_a = np.asarray(T_a, dtype=float)
+    T_b = np.asarray(T_b, dtype=float)
+    trans = float(np.linalg.norm(T_a[:3, 3] - T_b[:3, 3]))
+    R_rel = T_a[:3, :3].T @ T_b[:3, :3]
+    cos_theta = (np.trace(R_rel) - 1.0) / 2.0
+    rot = float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+    return trans, rot
+
+
+def is_distinct(
+    T: np.ndarray,
+    prior: Sequence[np.ndarray],
+    min_trans_m: float,
+    min_rot_rad: float,
+) -> bool:
+    """True if ``T`` differs from every pose in ``prior`` by at least
+    ``min_trans_m`` in translation OR ``min_rot_rad`` in rotation.
+
+    An empty ``prior`` is always distinct.
+    """
+    for other in prior:
+        trans, rot = pose_distance(T, other)
+        if trans < min_trans_m and rot < min_rot_rad:
+            return False
+    return True

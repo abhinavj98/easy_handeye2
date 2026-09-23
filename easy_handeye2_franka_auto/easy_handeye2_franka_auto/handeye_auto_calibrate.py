@@ -33,6 +33,16 @@ def _parse_args(argv):
     p.add_argument('--tf-dwell-sec', type=float, default=0.6,
                    help='hold after refresh so TF covers the sampler 0.2 s lookback')
     p.add_argument('--tf-rate-hz', type=float, default=30.0)
+    p.add_argument('--motion-mode', choices=('cartesian', 'dls'), default='dls',
+                   help="'cartesian' = original Cartesian streaming reset; "
+                        "'dls' = singularity-robust joint-space tracker that gets "
+                        "as close as possible and stops instead of faulting (default)")
+    p.add_argument('--min-rotation-diff-deg', type=float, default=2.0,
+                   help='skip take_sample if the measured pose is within both this '
+                        'and --min-translation-diff-m of an already-sampled pose')
+    p.add_argument('--min-translation-diff-m', type=float, default=0.005,
+                   help='skip take_sample if the measured pose is within both this '
+                        'and --min-rotation-diff-deg of an already-sampled pose')
     p.add_argument('--freedrive-poll-hz', type=float, default=0.0,
                    help='>0 polls robot state during free-drive (unverified on hardware; keep <=2)')
     p.add_argument('--min-samples', type=int, default=5)
@@ -52,6 +62,7 @@ def main(args=None):
     from easy_handeye2_msgs.msg import HandeyeCalibrationParameters
     from easy_handeye2_franka_auto.handeye_offsets import (
         compute_cube_poses,
+        is_distinct,
         snapshot_to_pose_4x4,
     )
     from easy_handeye2_franka_auto.handeye_tf_bridge import RobotTfBridge
@@ -121,19 +132,49 @@ def main(args=None):
             f'rot={cli.rotation_delta_degrees} deg, d={cli.cube_half_size_meters} m)'
         )
 
+        min_rot_rad = math.radians(cli.min_rotation_diff_deg)
+        sampled_poses = []
+        motion_failed = 0
+        duplicate_skipped = 0
+        sample_failed = 0
+        sampled = 0
         for i, T in enumerate(targets):
             log.info(f'Pose {i + 1}/{len(targets)}')
             try:
-                source.go_to(T, cli.settle_sec, cli.tf_dwell_sec)
+                residual = source.go_to(T, cli.settle_sec, cli.tf_dwell_sec, motion=cli.motion_mode)
             except Exception as exc:  # noqa: BLE001
                 log.error(f'Motion/state failure at pose index {i}: {exc}; skipping')
+                motion_failed += 1
                 continue
+            if residual is not None:
+                log.info(f'  DLS residual pose error: {residual:.4f}')
+
+            latest = source.latest()
+            measured = snapshot_to_pose_4x4(*latest) if latest is not None else T
+            if not is_distinct(measured, sampled_poses, cli.min_translation_diff_m, min_rot_rad):
+                log.warn(
+                    f'Skipping pose {i}: measured pose within '
+                    f'{cli.min_translation_diff_m} m / {cli.min_rotation_diff_deg} deg '
+                    f'of an already-sampled pose'
+                )
+                duplicate_skipped += 1
+                continue
+
             before = n_samples()
             client.take_sample()
             if sample_added(before, n_samples()):
                 log.info(f'Sample ok ({n_samples()} total)')
+                sampled_poses.append(measured)
+                sampled += 1
             else:
                 log.warn(f'Skipping pose {i}: sample not recorded (missing/extrapolating TF?)')
+                sample_failed += 1
+
+        log.info(
+            f'Pose loop done: planned={len(targets)} sampled={sampled} '
+            f'motion_failed={motion_failed} duplicate_skipped={duplicate_skipped} '
+            f'sample_failed={sample_failed}'
+        )
 
         total = n_samples()
         if should_save(total, cli.min_samples):
@@ -148,7 +189,7 @@ def main(args=None):
 
         if cli.return_home and home is not None:
             try:
-                source.go_to(home, cli.settle_sec, cli.tf_dwell_sec)
+                source.go_to(home, cli.settle_sec, cli.tf_dwell_sec, motion=cli.motion_mode)
             except Exception as exc:  # noqa: BLE001
                 log.error(f'Return-home failed: {exc}')
     finally:

@@ -2,7 +2,11 @@ import math
 
 import numpy as np
 import pytest
-from easy_handeye2_franka_auto.handeye_offsets import compute_cube_poses
+from easy_handeye2_franka_auto.handeye_offsets import (
+    compute_cube_poses,
+    is_distinct,
+    pose_distance,
+)
 
 
 def _home():
@@ -60,3 +64,60 @@ def test_invalid_n_poses_raises():
         compute_cube_poses(_home(), 0.1, 0.05, n_poses=0)
     with pytest.raises(ValueError):
         compute_cube_poses(_home(), 0.1, 0.05, n_poses=55)
+
+
+def _rot_z(deg):
+    rad = math.radians(deg)
+    T = np.eye(4)
+    T[:3, :3] = [
+        [math.cos(rad), -math.sin(rad), 0.0],
+        [math.sin(rad), math.cos(rad), 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    return T
+
+
+def test_pose_distance_identity_is_zero():
+    T = _home()
+    trans, rot = pose_distance(T, T)
+    assert trans == pytest.approx(0.0, abs=1e-9)
+    assert rot == pytest.approx(0.0, abs=1e-9)
+
+
+def test_pose_distance_pure_rotation():
+    trans, rot = pose_distance(np.eye(4), _rot_z(15))
+    assert trans == pytest.approx(0.0, abs=1e-9)
+    assert rot == pytest.approx(math.radians(15), abs=1e-6)
+
+
+def test_pose_distance_pure_translation():
+    T_a = np.eye(4)
+    T_b = np.eye(4)
+    T_b[:3, 3] = [0.03, 0.0, 0.0]
+    trans, rot = pose_distance(T_a, T_b)
+    assert trans == pytest.approx(0.03, abs=1e-9)
+    assert rot == pytest.approx(0.0, abs=1e-9)
+
+
+def test_is_distinct_true_for_empty_prior():
+    assert is_distinct(_home(), [], min_trans_m=0.005, min_rot_rad=math.radians(2)) is True
+
+
+def test_is_distinct_false_when_within_both_thresholds():
+    T_a = np.eye(4)
+    T_b = np.eye(4)
+    T_b[:3, 3] = [0.001, 0.0, 0.0]  # 1 mm, well under 5 mm threshold
+    assert is_distinct(T_b, [T_a], min_trans_m=0.005, min_rot_rad=math.radians(2)) is False
+
+
+def test_is_distinct_true_when_rotation_differs_enough():
+    T_a = np.eye(4)
+    T_b = _rot_z(10)  # 10 deg, past a 2 deg threshold; translation is identical (0)
+    assert is_distinct(T_b, [T_a], min_trans_m=0.005, min_rot_rad=math.radians(2)) is True
+
+
+def test_is_distinct_true_when_translation_differs_enough():
+    T_a = np.eye(4)
+    T_b = np.eye(4)
+    T_b[:3, 3] = [0.05, 0.0, 0.0]  # 5 cm, past a 5 mm threshold; rotation is identical
+    assert is_distinct(T_b, [T_a], min_trans_m=0.005, min_rot_rad=math.radians(2)) is True

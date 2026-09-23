@@ -7,7 +7,8 @@ robot:
   joint_velocity_max_jerk: 1000.0  # rad/s^3; smooths acceleration at replay start
   reset_duration_sec: 5  # Duration for Cartesian reset motion (legacy path)
 
-  # --- DLS mode (handeye_motion_test --motion-mode dls) ---------------------
+  # --- DLS mode (--motion-mode dls; default for handeye_auto_calibrate, ------
+  # opt-in for handeye_motion_test) -------------------------------------------
   # One joint-position session per move, streamed continuously at 1 kHz: every
   # cycle re-measures the live Jacobian/pose error and recomputes the DLS step
   # (continuous_dls_step in dls_motion.py) as a task-velocity-clamped

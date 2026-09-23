@@ -17,8 +17,16 @@ From free-drive home:
 - **Pool:** 9 × 6 = 54 poses; default run samples **15** with `--seed`
 
 Failed moves/samples are skipped (with `error_recovery` after a fault);
-compute/save runs if enough samples remain. Motions use Cartesian
-`reset_to_start_pose` (cosine/SLERP over `reset_duration_sec`).
+compute/save runs if enough samples remain. `--motion-mode` selects the
+per-pose motion (default **`dls`**, a singularity-robust joint-space tracker
+that stops at the closest safe pose instead of faulting; `cartesian` is the
+original `reset_to_start_pose` streaming move). Either way the sample is
+taken from the *measured* pose after the move, so a DLS move that stops
+short still yields a correct sample — just possibly close to an earlier one.
+`handeye_auto_calibrate` skips `take_sample` when the measured pose is
+within `--min-translation-diff-m` **and** `--min-rotation-diff-deg` of a
+pose already sampled, so short DLS stops don't add near-duplicate samples
+(which add no rotation diversity to the AX=XB solve).
 
 ## Prerequisites
 
@@ -53,7 +61,8 @@ ros2 run easy_handeye2_franka_auto handeye_auto_calibrate \
   --robot-config $(ros2 pkg prefix easy_handeye2_franka_auto)/share/easy_handeye2_franka_auto/config/robot.yaml \
   --name my_eob_calib \
   --robot-base-frame fr3_link0 \
-  --robot-effector-frame fr3_link8 \
+  --robot-effector-frame handeye_ee \
+  --motion-mode dls \
   --cube-half-size-meters 0.05 \
   --n-poses 15 \
   --seed 0 \
@@ -63,12 +72,24 @@ ros2 run easy_handeye2_franka_auto handeye_auto_calibrate \
 Adjust frame names to your setup. `config/robot.yaml` defaults to
 `use_mock: true`; set `use_mock: false` and the robot IP for hardware.
 
+`--robot-effector-frame` must **not** be a frame `robot_state_publisher` (or
+anything else) also publishes: `RobotTfBridge` publishes `O_T_EE`, the
+fingertip-midpoint frame (`NE_T_EE` in `config/robot.yaml` is identity, while
+Desk's `F_T_NE` already contains the 0.1034 m hand offset), not
+`fr3_link8`/`panda_link8`. `handeye_ee` above is a dedicated name that avoids
+the collision; any consistently-used EE frame gives a valid eye-on-base
+result.
+
 Useful flags:
 
+- `--motion-mode dls` — default; falls back to `cartesian` for the original
+  Cartesian streaming reset
 - `--first-n 1` — single-pose bring-up (after subset selection)
 - `--n-poses 15` / `--seed 0` — subset size and RNG seed
 - `--cube-half-size-meters 0.05` — cube half-extent in the base frame
 - `--tf-dwell-sec 0.6` — hold after refresh so TF covers the sampler's 0.2 s lookback
+- `--min-translation-diff-m 0.005` / `--min-rotation-diff-deg 2.0` — how close a
+  measured pose can be to an already-sampled one before it's skipped
 - `--freedrive-poll-hz 0` — default; set `1` only after confirming hand-guiding still works
 - `--keep-existing-samples` — do not clear samples already on the handeye server
 
