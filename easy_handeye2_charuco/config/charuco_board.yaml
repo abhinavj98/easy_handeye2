@@ -1,0 +1,13 @@
+# Board geometry for the printed ChArUco board (single source of truth).
+# Measure square_length / marker_length on the *print* with calipers: any
+# scale error here goes straight into the calibration translation.
+charuco_tf_publisher:
+  ros__parameters:
+    squares_x: 5
+    squares_y: 4
+    square_length: 0.0222        # m
+    marker_length: 0.0162        # m
+    dictionary: DICT_5X5_100
+    min_charuco_corners: 4
+    max_reproj_err_px: 2.0       # don't publish TF for worse PnP fits
+    axis_length: 0.05            # m, debug overlay only
