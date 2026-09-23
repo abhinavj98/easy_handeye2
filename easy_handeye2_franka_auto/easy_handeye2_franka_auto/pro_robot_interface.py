@@ -50,6 +50,9 @@ from easy_handeye2_franka_auto.robot_interface import (
     make_ee_target_pose_from_matrix,
     _FR3_JOINT_POS_LIMITS,
     _FR3_JOINT_VEL_LIMITS,
+    _FR3_JOINT_ACCEL_LIMITS,
+    _FR3_JOINT_JERK_LIMITS,
+    _FR3_JOINT_POS_LIMITS_URDF,
     _MAX_TORQUE_DELTA,
     _FR3_JOINT_TORQUE_LIMITS,
     _SAFETY_MARGIN_POS,
@@ -198,6 +201,12 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
         _quat_slerp,
         _quat_wxyz_to_rotation_matrix_np,
     )
+    from easy_handeye2_franka_auto.dls_motion import limit_blas_threads
+
+    # libfranka runs this thread at SCHED_FIFO; multithreaded BLAS would make it wait
+    # on normal-priority helper threads (measured: 40 ms stalls -> missed commands ->
+    # communication_constraints_violation). See limit_blas_threads.
+    _blas_limit = limit_blas_threads()  # noqa: F841 (keep the limiter alive)
 
     robot_cfg = config['robot']
 
@@ -277,8 +286,16 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
 
                     ctrl = robot.start_cartesian_pose_control(ControllerMode.JointImpedance)
                     state, _ = ctrl.readOnce()
-                    start_flat = np.array(state.O_T_EE)
-                    initial_pose = state.O_T_EE
+                    # Seed from the last *commanded* pose (libfranka's own Cartesian
+                    # examples do this), not the measured O_T_EE. Under JointImpedance
+                    # the measured pose sits off the commanded one by the tracking
+                    # error; seeding with it makes the first cycles a step that trips
+                    # cartesian_motion_generator_{velocity,acceleration}_discontinuity.
+                    initial_pose = next(
+                        (getattr(state, name) for name in ("O_T_EE_c", "O_T_EE_d", "O_T_EE")
+                         if getattr(state, name, None) is not None),
+                    )
+                    start_flat = np.array(initial_pose)
 
                     start_R = np.array([
                         [start_flat[0], start_flat[4], start_flat[8]],
@@ -685,30 +702,204 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                     response_queue.put(("error", str(e)))
 
             elif cmd[0] == "move_joints":
-                target_q = np.array(cmd[1], dtype=np.float64)
-                duration_sec = cmd[2]
+                try:
+                    target_q = np.array(cmd[1], dtype=np.float64)
+                    duration_sec = cmd[2]
+                    hold_steps = int(robot_cfg.get("joint_move_hold_steps", 200))
 
-                ctrl = robot.start_joint_position_control(ControllerMode.JointImpedance)
-                state, _ = ctrl.readOnce()
-                start_q = np.array(state.q)
-
-                n_steps = int(duration_sec * 1000)
-                for i in range(n_steps):
-                    alpha = 0.5 * (1.0 - math.cos(math.pi * (i + 1) / n_steps))
-                    interp_q = (1.0 - alpha) * start_q + alpha * target_q
-
-                    jcmd = JointPositions(interp_q.tolist())
-                    if i == n_steps - 1:
-                        jcmd.motion_finished = True
-                        ctrl.writeOnce(jcmd)
-                        break
-                    ctrl.writeOnce(jcmd)
+                    ctrl = robot.start_joint_position_control(ControllerMode.JointImpedance)
                     state, _ = ctrl.readOnce()
+                    start_q = np.asarray(state.q, dtype=np.float64).copy()
+                    q_hold = start_q.tolist()
+                    for _ in range(max(hold_steps, 1)):
+                        ctrl.writeOnce(JointPositions(q_hold))
+                        state, _ = ctrl.readOnce()
 
-                ctrl = None
-                robot.stop()
-                time.sleep(0.5)
-                response_queue.put(("move_done", None))
+                    n_steps = max(int(duration_sec * 1000), 1)
+                    for i in range(n_steps):
+                        alpha = 0.5 * (1.0 - math.cos(math.pi * (i + 1) / n_steps))
+                        interp_q = (1.0 - alpha) * start_q + alpha * target_q
+                        jcmd = JointPositions(interp_q.tolist())
+                        if i == n_steps - 1:
+                            jcmd.motion_finished = True
+                            ctrl.writeOnce(jcmd)
+                            break
+                        ctrl.writeOnce(jcmd)
+                        state, _ = ctrl.readOnce()
+
+                    ctrl = None
+                    robot.stop()
+                    time.sleep(0.5)
+                    response_queue.put(("move_done", None))
+                except Exception as e:
+                    sys.stdout.write(f"[COMM PROCESS] Move joints failed: {e}\r\n")
+                    sys.stdout.flush()
+                    try:
+                        ctrl = None
+                        robot.stop()
+                    except Exception:
+                        pass
+                    try:
+                        robot.automatic_error_recovery()
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                    response_queue.put(("error", str(e)))
+
+            elif cmd[0] == "move_pose_dls":
+                # Single joint-position session per move, streamed continuously at
+                # 1 kHz by dls_motion.run_continuous_dls_move: every cycle re-measures
+                # the live Jacobian/pose error and recomputes the DLS step, with a
+                # singularity barrier on the smallest Jacobian singular value, an
+                # always-on manipulability-raising nullspace term, joint-limit-aware
+                # solving, and franka::limitRate as a safety net. See dls_motion.py.
+                import gc
+                hop_log = []
+                # Diagnostics for the joint_motion_generator_*_discontinuity fault seen on
+                # real hardware but not reproduced by any zero-latency unit test: real
+                # wall-clock time per cycle (FR3 has zero tolerance for late control
+                # packets per libfranka's rate_limiting.h) and a short rolling window of
+                # recent commanded-velocity/acceleration fractions-of-limit, dumped by the
+                # except block below on any failure so the next occurrence is diagnosable
+                # instead of another guess.
+                cycle_times_ms = []
+                diag_ring = []
+                _DIAG_MAXLEN = 20
+                dls_failure = None
+                try:
+                    from easy_handeye2_franka_auto.dls_motion import (
+                        DT,
+                        DlsParams,
+                        JointPositionStreamer,
+                        otee_flat_to_Rt,
+                        reshape_jacobian_colmajor,
+                        run_continuous_dls_move,
+                    )
+
+                    target_pose_4x4 = np.array(cmd[1], dtype=np.float64)
+                    R_des = target_pose_4x4[:3, :3]
+                    t_des = target_pose_4x4[:3, 3]
+                    p = DlsParams.from_config(
+                        robot_cfg, _FR3_JOINT_VEL_LIMITS, _FR3_JOINT_ACCEL_LIMITS,
+                        _FR3_JOINT_JERK_LIMITS, _FR3_JOINT_POS_LIMITS_URDF)
+
+                    def read_pose_and_jacobian(state):
+                        R_cur, t_cur = otee_flat_to_Rt(state.O_T_EE)
+                        return R_cur, t_cur, reshape_jacobian_colmajor(model.zero_jacobian(state))
+
+                    # t_prev_cycle starts as None so the first sample (which would span
+                    # the start-of-session hold, ~hold_first_steps ms) isn't recorded.
+                    t_prev_cycle = [None]
+                    stream_ref = [None]
+                    prev_cmd = [None]
+
+                    def on_send(cycle, v_prev, v_cmd):
+                        t_now = time.perf_counter()
+                        cycle_dt_ms = float("nan")
+                        if t_prev_cycle[0] is not None:
+                            cycle_dt_ms = (t_now - t_prev_cycle[0]) * 1000.0
+                            cycle_times_ms.append(cycle_dt_ms)
+                        t_prev_cycle[0] = t_now
+                        stream = stream_ref[0]
+                        sent = stream.last_command
+                        prev = prev_cmd[0] if prev_cmd[0] is not None else sent
+                        prev_cmd[0] = sent
+                        if cycle is None:
+                            return
+                        # Called right after the write; stream.state is the tick this
+                        # command answers, so a healthy robot has q_d == the *previous*
+                        # command (|q_d-prev_sent| ~ 0). If it stays put instead, commands
+                        # are being dropped (late or lost) and a *_discontinuity follows.
+                        s = stream.state
+                        q_d = np.asarray(getattr(s, "q_d", sent), dtype=float)
+                        diag_ring.append((
+                            cycle, cycle_dt_ms,
+                            float(np.max(np.abs(v_cmd)) / np.max(p.rate_vel)),
+                            float(np.max(np.abs(v_cmd - v_prev)) / DT / np.max(p.rate_acc)),
+                            float(np.max(np.abs(q_d - sent))),
+                            float(np.max(np.abs(q_d - prev))),
+                            float(getattr(s, "control_command_success_rate", float("nan"))),
+                        ))
+                        if len(diag_ring) > _DIAG_MAXLEN:
+                            diag_ring.pop(0)
+
+
+                    gc.disable()
+                    try:
+                        ctrl = robot.start_joint_position_control(ControllerMode.JointImpedance)
+                        stream = JointPositionStreamer(
+                            ctrl, JointPositions, p.rate_vel, p.rate_acc, p.rate_jerk)
+                        stream_ref[0] = stream
+                        result = run_continuous_dls_move(
+                            stream, read_pose_and_jacobian, R_des, t_des, p,
+                            log=hop_log, on_send=on_send)
+                        state = stream.state
+                        jac_flat = model.zero_jacobian(state)
+                        mass_flat = model.mass(state)
+                        gravity = model.gravity(state)
+                        _pack_state(state, [0.0] * 6, jac_flat, mass_flat, gravity)
+                        state_ready.set()
+                        ctrl = None
+                        robot.stop()
+                        time.sleep(0.3)
+                    finally:
+                        gc.enable()
+
+                    for line in hop_log:
+                        sys.stdout.write(f"[COMM PROCESS] DLS {line}\r\n")
+                    if cycle_times_ms:
+                        arr = np.asarray(cycle_times_ms)
+                        sys.stdout.write(
+                            f"[COMM PROCESS] DLS cycle timing: n={arr.size} mean={arr.mean():.3f}ms "
+                            f"max={arr.max():.3f}ms p99={np.percentile(arr, 99):.3f}ms "
+                            f"n_over_1.5ms={int(np.sum(arr > 1.5))}\r\n")
+                    sys.stdout.write(
+                        f"[COMM PROCESS] DLS move done ({result.stop_reason}): "
+                        f"pos_err={result.pos_err_m:.4f}m, rot_err={result.rot_err_rad:.4f}rad, "
+                        f"final_sigma_min={result.sigma_min:.4f}\r\n"
+                    )
+                    sys.stdout.flush()
+                    response_queue.put(("move_pose_dls_done", result.residual))
+                except Exception as e:
+                    for line in hop_log:
+                        sys.stdout.write(f"[COMM PROCESS] DLS {line}\r\n")
+                    if cycle_times_ms:
+                        arr = np.asarray(cycle_times_ms)
+                        sys.stdout.write(
+                            f"[COMM PROCESS] DLS cycle timing: n={arr.size} mean={arr.mean():.3f}ms "
+                            f"max={arr.max():.3f}ms p99={np.percentile(arr, 99):.3f}ms "
+                            f"n_over_1.5ms={int(np.sum(arr > 1.5))}\r\n")
+                    for rec in diag_ring:
+                        c, dt_ms, vfrac, afrac, qd_vs_sent, qd_vs_prev, success = rec
+                        sys.stdout.write(
+                            f"[COMM PROCESS] DLS diag cycle={c} dt={dt_ms:.3f}ms "
+                            f"vel_frac={vfrac:.3f} acc_frac={afrac:.3f} "
+                            f"|q_d-sent|={qd_vs_sent:.2e} |q_d-prev_sent|={qd_vs_prev:.2e} "
+                            f"success_rate={success:.3f}\r\n")
+                    sys.stdout.write(f"[COMM PROCESS] DLS move failed: {e}\r\n")
+                    sys.stdout.flush()
+                    dls_failure = str(e)
+                # Recover *outside* the except block: while it runs, the exception's
+                # traceback keeps every frame of the failed move alive, including the
+                # streamer and its control session, so robot.stop() can't end the session
+                # and every later move fails with "another control or read operation is
+                # running".
+                if dls_failure is not None:
+                    stream_ref[0] = None
+                    stream = None
+                    ctrl = None
+                    gc.collect()
+                    try:
+                        robot.stop()
+                    except Exception:
+                        pass
+                    try:
+                        robot.automatic_error_recovery()
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    response_queue.put(("error", dls_failure))
 
             elif cmd[0] == "calibrate_ft":
                 try:
@@ -1096,6 +1287,25 @@ class FrankaInterface:
         resp = self._response_queue.get(timeout=30.0)
         if resp[0] != "reset_done":
             raise RuntimeError(f"Reset failed: {resp}")
+
+    def move_to_pose_dls(self, target_pose_4x4: np.ndarray) -> float:
+        """Track target EE pose with damped least-squares joint steps.
+
+        Reaches the target when possible; otherwise stops at the closest
+        reachable configuration (stall / timeout) instead of aborting on
+        Cartesian velocity discontinuities.
+
+        Returns:
+            Residual 6D pose error norm after the move.
+        """
+        # Margin above dls_timeout_sec (the in-loop cutoff in dls_motion.py) for
+        # session start/stop overhead (hold_first_steps, finish_max_steps, robot.stop()).
+        timeout = float(self._config.get("robot", {}).get("dls_timeout_sec", 20.0)) + 30.0
+        self._cmd_queue.put(("move_pose_dls", np.asarray(target_pose_4x4, dtype=float).tolist()))
+        resp = self._response_queue.get(timeout=timeout)
+        if resp[0] != "move_pose_dls_done":
+            raise RuntimeError(f"DLS move failed: {resp}")
+        return float(resp[1])
 
     def refresh_state_snapshot(self):
         """Refresh shared-memory state from the robot without moving it.

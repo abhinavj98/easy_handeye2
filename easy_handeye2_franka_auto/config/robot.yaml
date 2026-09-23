@@ -5,7 +5,57 @@ robot:
   control_rate_hz: 1000.0      # high-level control/data-collection rate; PRO callback is fixed at 1 kHz
   joint_velocity_max_delta_per_step: 0.003
   joint_velocity_max_jerk: 1000.0  # rad/s^3; smooths acceleration at replay start
-  reset_duration_sec: 5  # Duration for Cartesian reset motion
+  reset_duration_sec: 5  # Duration for Cartesian reset motion (legacy path)
+
+  # --- DLS mode (handeye_motion_test --motion-mode dls) ---------------------
+  # One joint-position session per move, streamed continuously at 1 kHz: every
+  # cycle re-measures the live Jacobian/pose error and recomputes the DLS step
+  # (continuous_dls_step in dls_motion.py) as a task-velocity-clamped
+  # proportional correction, so there's no hop/settle boundary to stop at.
+  # Every command still goes through a port of franka::limitRate against the
+  # robot's q_d/dq_d/ddq_d as a safety net (the robot faults with
+  # *_discontinuity if implied accel > 10 rad/s^2 or jerk > 5000 rad/s^3).
+  # Singularity avoidance uses sigma_min, the smallest Jacobian singular value
+  # (FR3 ready pose ~0.22). A barrier lets sigma_min decay at most
+  # exponentially toward dls_sigma_floor and never below it, trading task
+  # tracking error for distance to the singularity; an always-on nullspace
+  # term climbs log-manipulability. If the target can't be reached safely the
+  # move stops at the closest safe pose (stall / joint limits / timeout).
+  dls_kp_pos: 2.0                    # proportional gain on position error (1/s)
+  dls_kp_rot: 2.0                    # proportional gain on rotation error (1/s)
+  dls_task_vel_pos_m_s: 0.03         # max task-space linear speed
+  dls_task_vel_rot_rad_s: 0.15       # max task-space angular speed
+  dls_sigma_avoid: 0.10              # below this: extra damping, stronger nullspace push, posture pull
+  dls_sigma_floor: 0.05              # barrier: sigma_min never commanded below this
+  dls_sigma_stop: 0.03               # hard-stop backstop (should never trigger with the barrier)
+  dls_barrier_gain: 2.0              # 1/s: max exponential decay rate of sigma_min toward the floor
+  dls_null_grad_gain_min: 0.02       # always-on log-manipulability ascent gain
+  dls_null_grad_gain_max: 0.2        # ... ramped up to this as sigma_min -> floor
+  dls_null_gain_max: 0.5             # posture pull toward dls_escape_q_preferred, ramps in below dls_sigma_avoid
+  dls_null_vel_max: 0.2              # rad/s cap on nullspace self-motion
+  dls_vel_smoothing_sec: 0.05        # 2-stage low-pass on target joint velocity (jerk smoothing; ~0.1 s lag)
+  dls_stall_window_sec: 2.0          # time without dls_min_improve progress before stopping
+  dls_timeout_sec: 40.0              # overall move cutoff (also bounds the caller's IPC wait, +30s margin)
+  dls_log_interval_sec: 0.5          # how often to append a progress log line
+  dls_plan_limit_frac: 0.25          # per-cycle step uses this fraction of vel/acc/jerk limits
+  dls_rate_limit_frac: 0.7           # rate-limiter safety net (must stay < 1)
+  dls_lambda_min: 0.05               # damping away from singularities
+  dls_lambda_max: 0.15               # extra damping blended in as sigma_min -> 0 (below dls_sigma_avoid)
+  dls_joint_limit_margin_rad: 0.1    # keep this far inside FR3 joint limits
+  dls_pos_tol_m: 0.003
+  dls_rot_tol_rad: 0.02
+  dls_min_improve: 0.0001
+  dls_hold_steps_first: 50           # cycles holding the start pose at session start
+  dls_finish_max_steps: 1000         # max cycles waiting for motion to die out before finishing
+  # dls_escape_q_preferred defaults to the standard FR3 "ready" pose (the
+  # continuous nullspace bias target above).
+  # The following are unused by the continuous tracker; kept only for
+  # plan_dls_hop / plan_nullspace_escape_hop, the discrete quintic-hop
+  # planner still in dls_motion.py as an alternate/reference implementation:
+  # dls_max_task_step_m, dls_max_task_step_rad, dls_min_segment_sec,
+  # dls_segment_duration_sec, dls_max_segments, dls_stall_segments,
+  # dls_settle_steps, dls_escape_step_rad, dls_escape_max_hops.
+  joint_move_hold_steps: 200        # used by the plain "move_joints" command only
 
   # Per-episode FT calibration: hold position and average O_F_ext_hat_K
   # for this many seconds before each episode. Replaces static ft_bias.

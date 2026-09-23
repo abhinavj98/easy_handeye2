@@ -1,11 +1,24 @@
 # easy_handeye2_franka_auto
 
 Automated eye-on-base hand-eye sampling: free-drive the marker into camera
-center, then run A-style EE offsets via a vendored pylibfranka
-`FrankaInterface`, publish robot `tf` from a cached pose, and call
-`easy_handeye2` sample/compute/save services.
+center, then run a random subset of cube-corner × EE-tilt poses via a
+vendored pylibfranka `FrankaInterface`, publish robot `tf` from a cached
+pose, and call `easy_handeye2` sample/compute/save services.
 
-Design: `docs/superpowers/specs/2026-09-21-franka-auto-handeye-design.md`
+Design: `docs/superpowers/specs/2026-09-21-cube-subset-poses-design.md`  
+(Package bring-up: `docs/superpowers/specs/2026-09-21-franka-auto-handeye-design.md`)
+
+## Pose set
+
+From free-drive home:
+
+- **Translations (base):** center + 8 cube corners at `(±d, ±d, ±d)`
+- **Tilts (EE):** ±X, ±Y, ±Z at `--rotation-delta-degrees`
+- **Pool:** 9 × 6 = 54 poses; default run samples **15** with `--seed`
+
+Failed moves/samples are skipped (with `error_recovery` after a fault);
+compute/save runs if enough samples remain. Motions use Cartesian
+`reset_to_start_pose` (cosine/SLERP over `reset_duration_sec`).
 
 ## Prerequisites
 
@@ -26,10 +39,12 @@ ros2 run easy_handeye2_franka_auto handeye_motion_test \
   --robot-config $(ros2 pkg prefix easy_handeye2_franka_auto)/share/easy_handeye2_franka_auto/config/robot.yaml \
   --first-n 3 \
   --rotation-delta-degrees 15 \
-  --translation-delta-meters 0.05
+  --cube-half-size-meters 0.05 \
+  --n-poses 15 \
+  --seed 0
 ```
 
-Free-drive to a safe pose, press Enter; it runs the first N offsets and returns home.
+Free-drive to a safe pose, press Enter; it runs the first N selected poses and returns home.
 
 ## Full auto-calibrate
 
@@ -39,6 +54,9 @@ ros2 run easy_handeye2_franka_auto handeye_auto_calibrate \
   --name my_eob_calib \
   --robot-base-frame fr3_link0 \
   --robot-effector-frame fr3_link8 \
+  --cube-half-size-meters 0.05 \
+  --n-poses 15 \
+  --seed 0 \
   --return-home
 ```
 
@@ -47,7 +65,9 @@ Adjust frame names to your setup. `config/robot.yaml` defaults to
 
 Useful flags:
 
-- `--first-n 1` — single-pose bring-up
+- `--first-n 1` — single-pose bring-up (after subset selection)
+- `--n-poses 15` / `--seed 0` — subset size and RNG seed
+- `--cube-half-size-meters 0.05` — cube half-extent in the base frame
 - `--tf-dwell-sec 0.6` — hold after refresh so TF covers the sampler's 0.2 s lookback
 - `--freedrive-poll-hz 0` — default; set `1` only after confirming hand-guiding still works
 - `--keep-existing-samples` — do not clear samples already on the handeye server

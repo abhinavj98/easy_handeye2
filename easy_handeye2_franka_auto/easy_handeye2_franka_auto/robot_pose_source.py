@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -48,10 +49,61 @@ class RobotPoseSource:
                 raise
             self._set_cache((pos, quat))
 
+    def _recover(self) -> None:
+        recover = getattr(self._robot, "error_recovery", None)
+        if recover is None:
+            return
+        try:
+            recover()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("error_recovery failed: %s", exc)
+
     def move_to(self, target_pose_4x4: np.ndarray) -> None:
+        """Cartesian cosine move to target; recover on reflex then re-raise."""
         with self._robot_lock:
             self._set_cache(None)
-            self._robot.reset_to_start_pose(np.asarray(target_pose_4x4, dtype=float))
+            T = np.asarray(target_pose_4x4, dtype=float)
+            try:
+                self._robot.reset_to_start_pose(T)
+            except Exception:
+                self._recover()
+                raise
+
+    def move_to_dls(self, target_pose_4x4: np.ndarray) -> float:
+        """Damped-least-squares joint-space move; gets as close as the geometry
+        allows and stops instead of raising, unless the robot itself faults."""
+        with self._robot_lock:
+            self._set_cache(None)
+            T = np.asarray(target_pose_4x4, dtype=float)
+            try:
+                return self._robot.move_to_pose_dls(T)
+            except Exception:
+                self._recover()
+                raise
+
+    def go_to(
+        self,
+        target_pose_4x4: np.ndarray,
+        settle_sec: float,
+        dwell_sec: float,
+        motion: str = "cartesian",
+    ) -> Optional[float]:
+        """Move, let the arm settle, read the measured pose, then hold so TF covers
+        the sampler's 0.2 s lookback. Shared by the calibrate loop and the motion
+        test. ``motion='dls'`` uses the singularity-robust joint-space tracker and
+        returns its residual pose error; ``motion='cartesian'`` (default) uses the
+        original Cartesian streaming move and returns None."""
+        if motion == "cartesian":
+            self.move_to(target_pose_4x4)
+            residual = None
+        elif motion == "dls":
+            residual = self.move_to_dls(target_pose_4x4)
+        else:
+            raise ValueError(f"unknown motion mode: {motion!r}")
+        time.sleep(settle_sec)
+        self.refresh()
+        time.sleep(dwell_sec)
+        return residual
 
     def start_polling(self, hz: float) -> None:
         if self._poll_thread is not None or hz <= 0:

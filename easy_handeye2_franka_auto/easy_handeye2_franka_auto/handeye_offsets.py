@@ -1,7 +1,8 @@
-"""A-style hand-eye pose offsets around a free-driven home EE pose."""
+"""Cube corner+center × EE-tilt poses around a free-driven home EE pose."""
 from __future__ import annotations
 
-from itertools import chain
+import random
+from itertools import product
 from typing import List
 
 import numpy as np
@@ -76,37 +77,43 @@ def snapshot_to_pose_4x4(ee_pos: np.ndarray, ee_quat_wxyz: np.ndarray) -> np.nda
     return T
 
 
-def compute_poses_around_state(
+def compute_cube_poses(
     home_pose_4x4: np.ndarray,
     angle_delta_rad: float,
-    translation_delta_m: float,
+    cube_half_size_m: float,
+    n_poses: int = 15,
+    seed: int = 0,
 ) -> List[np.ndarray]:
+    """Base-frame cube (center+8 corners) × EE ±X/Y/Z tilts; random subset.
+
+    Pool size is always 54. Returns ``n_poses`` poses sampled without
+    replacement using ``seed``. Raises ValueError if n_poses not in 1..54.
+    """
     home = np.asarray(home_pose_4x4, dtype=float).copy()
-    basis = np.eye(3)
     home_q = _R_to_quat_wxyz(home[:3, :3])
+    d = float(cube_half_size_m)
 
-    final_rots = []
-    for scale in (1.0, 0.5):
-        pos_deltas = [_quat_from_euler_xyz(*(axis * angle_delta_rad * scale)) for axis in basis]
-        neg_deltas = [_quat_from_euler_xyz(*(axis * (-angle_delta_rad * scale))) for axis in basis]
-        final_rots.extend(chain.from_iterable(zip(pos_deltas, neg_deltas)))
+    translations = [np.zeros(3, dtype=float)]
+    for sx, sy, sz in product((-d, d), repeat=3):
+        translations.append(np.array([sx, sy, sz], dtype=float))
 
-    poses: List[np.ndarray] = []
-    for qd in final_rots:
-        q = _quat_multiply_wxyz(home_q, qd)
-        T = home.copy()
-        T[:3, :3] = _quat_wxyz_to_R(q)
-        poses.append(T)
+    basis = np.eye(3)
+    rot_deltas = []
+    for axis in basis:
+        rot_deltas.append(_quat_from_euler_xyz(*(axis * angle_delta_rad)))
+        rot_deltas.append(_quat_from_euler_xyz(*(axis * (-angle_delta_rad))))
 
-    for delta in (
-        np.array([translation_delta_m / 2, 0.0, 0.0]),
-        np.array([-translation_delta_m / 2, 0.0, 0.0]),
-        np.array([0.0, translation_delta_m, 0.0]),
-        np.array([0.0, -translation_delta_m, 0.0]),
-        np.array([0.0, 0.0, translation_delta_m / 3]),
-    ):
-        T = home.copy()
-        T[:3, 3] = home[:3, 3] + delta
-        poses.append(T)
+    pool: List[np.ndarray] = []
+    for t in translations:
+        for qd in rot_deltas:
+            T = home.copy()
+            T[:3, 3] = home[:3, 3] + t
+            T[:3, :3] = _quat_wxyz_to_R(_quat_multiply_wxyz(home_q, qd))
+            pool.append(T)
 
-    return poses
+    if len(pool) != 54:
+        raise RuntimeError(f'expected pool size 54, got {len(pool)}')
+    if n_poses < 1 or n_poses > len(pool):
+        raise ValueError(f'n_poses must be in 1..{len(pool)}, got {n_poses}')
+    rng = random.Random(seed)
+    return rng.sample(pool, n_poses)

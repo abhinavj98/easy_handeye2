@@ -1,4 +1,4 @@
-"""CLI: free-drive home → A-style offsets → move only (no handeye / TF)."""
+"""CLI: free-drive home → cube-subset offsets → move only (no handeye / TF)."""
 from __future__ import annotations
 
 import argparse
@@ -9,21 +9,25 @@ from pathlib import Path
 
 def _parse_args(argv):
     p = argparse.ArgumentParser(
-        description='Motion-only smoke test: free-drive home, then run A-style EE offsets')
+        description='Motion-only smoke test: free-drive home, then cube-subset EE offsets')
     p.add_argument('--robot-config', type=Path, required=True,
                    help='YAML with robot: {ip, use_mock, reset_duration_sec, ...}')
     p.add_argument('--rotation-delta-degrees', type=float, default=15.0,
-                   help='rotation magnitude for offsets (default 15, smaller than full cal)')
-    p.add_argument('--translation-delta-meters', type=float, default=0.05,
-                   help='translation magnitude for offsets (default 0.05)')
+                   help='EE-frame tilt magnitude about ±X/Y/Z (default 15)')
+    p.add_argument('--cube-half-size-meters', type=float, default=0.05,
+                   help='base-frame cube half-size; corners at (±d,±d,±d)')
+    p.add_argument('--n-poses', type=int, default=15,
+                   help='random subset size from the 54-pose pool (default 15)')
+    p.add_argument('--seed', type=int, default=0, help='RNG seed for pose subset')
     p.add_argument('--settle-sec', type=float, default=1.0)
     p.add_argument('--tf-dwell-sec', type=float, default=0.6,
                    help='hold after refresh (same as handeye_auto_calibrate)')
+    p.add_argument('--motion-mode', choices=('cartesian', 'dls'), default='cartesian',
+                   help="'cartesian' = original Cartesian streaming reset; "
+                        "'dls' = singularity-robust joint-space tracker that gets "
+                        "as close as possible and stops instead of faulting")
     p.add_argument('--first-n', type=int, default=3,
-                   help='only run the first N offset poses (0 = all; default 3). '
-                        'Note: poses 1-12 are EE rotations; 13-17 are base translations.')
-    p.add_argument('--translations-only', action='store_true',
-                   help='skip EE rotations; only run base-frame translation offsets')
+                   help='only run the first N selected poses (0 = all; default 3)')
     p.add_argument('--return-home', action='store_true', default=True,
                    help='return to free-drive home after offsets (default on)')
     p.add_argument('--no-return-home', action='store_false', dest='return_home')
@@ -43,7 +47,7 @@ def main(args=None):
         robot_cfg = yaml.safe_load(f)
 
     from easy_handeye2_franka_auto.handeye_offsets import (
-        compute_poses_around_state,
+        compute_cube_poses,
         snapshot_to_pose_4x4,
     )
     from easy_handeye2_franka_auto.pro_robot_interface import FrankaInterface
@@ -51,6 +55,7 @@ def main(args=None):
 
     robot = FrankaInterface(robot_cfg, device='cpu')
     source = RobotPoseSource(robot)
+    home = None
     try:
         input('Free-drive to a safe start pose, then press Enter...')
         source.refresh()
@@ -60,35 +65,45 @@ def main(args=None):
         pos, quat = latest
         home = snapshot_to_pose_4x4(pos, quat)
 
-        targets = compute_poses_around_state(
+        targets = compute_cube_poses(
             home,
             math.radians(cli.rotation_delta_degrees),
-            cli.translation_delta_meters,
+            cli.cube_half_size_meters,
+            n_poses=cli.n_poses,
+            seed=cli.seed,
         )
-        # Pose layout: [12 EE rotations] + [5 base translations].
-        # With rotation_delta=0 the first 12 are identical to home — skip them
-        # unless the user explicitly wants that no-op list.
-        if cli.translations_only or abs(cli.rotation_delta_degrees) < 1e-9:
-            targets = targets[12:]
-            print('Using translation offsets only (base ±X/±Y/+Z)')
         if cli.first_n > 0:
             targets = targets[:cli.first_n]
-        print(f'Home captured; running {len(targets)} offset poses '
-              f'(rot={cli.rotation_delta_degrees} deg, '
-              f'trans={cli.translation_delta_meters} m)')
+        print(
+            f'Home captured; running {len(targets)} cube-subset poses '
+            f'(pool=54, n_poses={cli.n_poses}, seed={cli.seed}, '
+            f'rot={cli.rotation_delta_degrees} deg, d={cli.cube_half_size_meters} m)'
+        )
 
+        succeeded = 0
+        failed_indices = []
         for i, T in enumerate(targets):
             print(f'Pose {i + 1}/{len(targets)}')
             try:
-                source.go_to(T, cli.settle_sec, cli.tf_dwell_sec)
+                residual = source.go_to(T, cli.settle_sec, cli.tf_dwell_sec, motion=cli.motion_mode)
             except Exception as exc:  # noqa: BLE001
-                print(f'Motion/state failure at pose index {i}: {exc}')
-                return
+                print(f'Motion/state failure at pose index {i}: {exc}; skipping')
+                failed_indices.append(i)
+                continue
+            succeeded += 1
+            if residual is not None:
+                print(f'  DLS residual pose error: {residual:.4f}')
 
-        if cli.return_home:
+        if cli.return_home and home is not None:
             print('Returning home')
-            source.go_to(home, cli.settle_sec, cli.tf_dwell_sec)
-        print('Motion test done')
+            try:
+                source.go_to(home, cli.settle_sec, cli.tf_dwell_sec, motion=cli.motion_mode)
+            except Exception as exc:  # noqa: BLE001
+                print(f'Return-home failed: {exc}')
+        print(
+            f'Motion test done ({cli.motion_mode}): {succeeded}/{len(targets)} poses ok'
+            + (f'; faulted at indices {failed_indices}' if failed_indices else '')
+        )
     finally:
         robot.shutdown()
 

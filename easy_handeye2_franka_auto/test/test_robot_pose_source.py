@@ -32,6 +32,14 @@ class FakeRobot:
         self._enter("reset")
         self.pos = np.asarray(T)[:3, 3].copy()
 
+    def move_to_pose_dls(self, T):
+        self._enter("dls")
+        self.pos = np.asarray(T)[:3, 3].copy()
+        return 0.0
+
+    def error_recovery(self):
+        self._enter("recover")
+
 
 def test_latest_none_before_refresh():
     assert RobotPoseSource(FakeRobot()).latest() is None
@@ -108,3 +116,80 @@ def test_polling_refreshes_and_stops():
     assert n >= 2
     time.sleep(0.1)
     assert robot.calls.count("refresh") == n
+
+
+def test_go_to_moves_then_refreshes_and_leaves_cache_populated():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    T = np.eye(4)
+    T[:3, 3] = [0.5, 0.0, 0.4]
+    src.go_to(T, settle_sec=0.0, dwell_sec=0.0)
+    assert robot.calls == ["reset", "refresh"]
+    np.testing.assert_allclose(src.latest()[0], [0.5, 0.0, 0.4])
+
+
+def test_move_recovers_then_reraises_on_reset_fault():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+
+    def boom(_T):
+        robot._enter("reset")
+        raise RuntimeError("reflex")
+
+    robot.reset_to_start_pose = boom
+    T = np.eye(4)
+    try:
+        src.move_to(T)
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert "recover" in robot.calls
+
+
+def test_move_to_dls_invalidates_cache_and_returns_residual():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    src.refresh()
+    T = np.eye(4)
+    T[:3, 3] = [0.6, 0.1, 0.2]
+    residual = src.move_to_dls(T)
+    assert residual == 0.0
+    assert src.latest() is None  # cache cleared; caller must refresh
+    assert robot.calls == ["refresh", "dls"]
+
+
+def test_go_to_dls_mode_dispatches_and_returns_residual():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+    T = np.eye(4)
+    T[:3, 3] = [0.6, 0.1, 0.2]
+    residual = src.go_to(T, settle_sec=0.0, dwell_sec=0.0, motion="dls")
+    assert residual == 0.0
+    assert robot.calls == ["dls", "refresh"]
+    np.testing.assert_allclose(src.latest()[0], [0.6, 0.1, 0.2])
+
+
+def test_go_to_rejects_unknown_motion_mode():
+    src = RobotPoseSource(FakeRobot())
+    try:
+        src.go_to(np.eye(4), 0.0, 0.0, motion="warp")
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_dls_recovers_then_reraises_on_fault():
+    robot = FakeRobot()
+    src = RobotPoseSource(robot)
+
+    def boom(_T):
+        robot._enter("dls")
+        raise RuntimeError("dls failed")
+
+    robot.move_to_pose_dls = boom
+    try:
+        src.move_to_dls(np.eye(4))
+        assert False, "expected RuntimeError"
+    except RuntimeError:
+        pass
+    assert "recover" in robot.calls

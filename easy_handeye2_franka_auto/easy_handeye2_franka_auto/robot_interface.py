@@ -198,6 +198,27 @@ _FR3_JOINT_POS_LIMITS = np.array([
 
 _FR3_JOINT_VEL_LIMITS = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100])
 
+# Max joint acceleration / jerk (libfranka include/franka/rate_limiting.h
+# kMaxJointAcceleration / kMaxJointJerk). The robot checks every commanded joint
+# position against these: exceeding acceleration reports
+# joint_motion_generator_velocity_discontinuity, exceeding jerk reports
+# joint_motion_generator_acceleration_discontinuity.
+_FR3_JOINT_ACCEL_LIMITS = np.array([10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+_FR3_JOINT_JERK_LIMITS = np.array([5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0, 5000.0])
+
+# FR3 joint position limits from franka_description robots/fr3/joint_limits.yaml.
+# (_FR3_JOINT_POS_LIMITS above is Panda-like, e.g. joint 6 lower -0.0175, and is
+# kept unchanged for the torque-mode safety check that already uses it.)
+_FR3_JOINT_POS_LIMITS_URDF = np.array([
+    [-2.7437, 2.7437],
+    [-1.7837, 1.7837],
+    [-2.9007, 2.9007],
+    [-3.0421, -0.1518],
+    [-2.8065, 2.8065],
+    [0.5445, 4.5169],
+    [-3.0159, 3.0159],
+])
+
 # Max torque change per 1kHz step: 1000 Nm/s * 0.001s = 1.0 Nm theoretical max
 # (from libfranka rate_limiting.h kMaxTorqueRate)
 # Use 0.75 for safety margin

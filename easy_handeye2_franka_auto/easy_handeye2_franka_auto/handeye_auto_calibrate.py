@@ -1,11 +1,10 @@
-"""CLI: free-drive home → A-style offsets → take_sample → compute/save."""
+"""CLI: free-drive home → cube-subset offsets → take_sample → compute/save."""
 from __future__ import annotations
 
 import argparse
 import math
 import sys
 import threading
-import time
 from pathlib import Path
 
 
@@ -23,8 +22,13 @@ def _parse_args(argv):
     p.add_argument('--name', required=True, help='easy_handeye2 calibration name (must match calibrate launch)')
     p.add_argument('--robot-base-frame', required=True)
     p.add_argument('--robot-effector-frame', required=True)
-    p.add_argument('--rotation-delta-degrees', type=float, default=25.0)
-    p.add_argument('--translation-delta-meters', type=float, default=0.1)
+    p.add_argument('--rotation-delta-degrees', type=float, default=25.0,
+                   help='EE-frame tilt magnitude about ±X/Y/Z (degrees)')
+    p.add_argument('--cube-half-size-meters', type=float, default=0.05,
+                   help='base-frame cube half-size; corners at (±d,±d,±d)')
+    p.add_argument('--n-poses', type=int, default=15,
+                   help='random subset size from the 54-pose cube×tilt pool')
+    p.add_argument('--seed', type=int, default=0, help='RNG seed for pose subset')
     p.add_argument('--settle-sec', type=float, default=1.0)
     p.add_argument('--tf-dwell-sec', type=float, default=0.6,
                    help='hold after refresh so TF covers the sampler 0.2 s lookback')
@@ -32,7 +36,7 @@ def _parse_args(argv):
     p.add_argument('--freedrive-poll-hz', type=float, default=0.0,
                    help='>0 polls robot state during free-drive (unverified on hardware; keep <=2)')
     p.add_argument('--min-samples', type=int, default=5)
-    p.add_argument('--first-n', type=int, default=0, help='only run the first N offset poses (0 = all)')
+    p.add_argument('--first-n', type=int, default=0, help='only run the first N selected poses (0 = all)')
     p.add_argument('--keep-existing-samples', action='store_true')
     p.add_argument('--return-home', action='store_true')
     return p.parse_args(argv)
@@ -47,7 +51,7 @@ def main(args=None):
     from easy_handeye2.handeye_client import HandeyeClient
     from easy_handeye2_msgs.msg import HandeyeCalibrationParameters
     from easy_handeye2_franka_auto.handeye_offsets import (
-        compute_poses_around_state,
+        compute_cube_poses,
         snapshot_to_pose_4x4,
     )
     from easy_handeye2_franka_auto.handeye_tf_bridge import RobotTfBridge
@@ -61,6 +65,7 @@ def main(args=None):
     node = rclpy.create_node('handeye_auto_calibrate')
     log = node.get_logger()
     robot = source = bridge = executor = None
+    home = None
     try:
         from easy_handeye2_franka_auto.pro_robot_interface import FrankaInterface
 
@@ -101,24 +106,28 @@ def main(args=None):
             raise RuntimeError('No EE pose after free-drive refresh')
         pos, quat = latest
         home = snapshot_to_pose_4x4(pos, quat)
-        targets = compute_poses_around_state(
-            home, math.radians(cli.rotation_delta_degrees), cli.translation_delta_meters)
+        targets = compute_cube_poses(
+            home,
+            math.radians(cli.rotation_delta_degrees),
+            cli.cube_half_size_meters,
+            n_poses=cli.n_poses,
+            seed=cli.seed,
+        )
         if cli.first_n > 0:
             targets = targets[:cli.first_n]
-        log.info(f'Home captured; running {len(targets)} offset poses')
+        log.info(
+            f'Home captured; running {len(targets)} cube-subset poses '
+            f'(pool=54, n_poses={cli.n_poses}, seed={cli.seed}, '
+            f'rot={cli.rotation_delta_degrees} deg, d={cli.cube_half_size_meters} m)'
+        )
 
-        motion_fault = False
         for i, T in enumerate(targets):
             log.info(f'Pose {i + 1}/{len(targets)}')
             try:
-                source.move_to(T)
-                time.sleep(cli.settle_sec)
-                source.refresh()
-                time.sleep(cli.tf_dwell_sec)
+                source.go_to(T, cli.settle_sec, cli.tf_dwell_sec)
             except Exception as exc:  # noqa: BLE001
-                log.error(f'Motion/state failure at pose index {i}: {exc}')
-                motion_fault = True
-                break
+                log.error(f'Motion/state failure at pose index {i}: {exc}; skipping')
+                continue
             before = n_samples()
             client.take_sample()
             if sample_added(before, n_samples()):
@@ -127,9 +136,7 @@ def main(args=None):
                 log.warn(f'Skipping pose {i}: sample not recorded (missing/extrapolating TF?)')
 
         total = n_samples()
-        if motion_fault:
-            log.error(f'Aborted after motion fault; NOT computing/saving. {total} samples remain on the server.')
-        elif should_save(total, cli.min_samples):
+        if should_save(total, cli.min_samples):
             result = client.compute_calibration()
             if result.valid:
                 saved = client.save()
@@ -139,8 +146,11 @@ def main(args=None):
         else:
             log.error(f'Not saving: only {total} samples (need >= {max(cli.min_samples, 3)})')
 
-        if cli.return_home and not motion_fault:
-            source.move_to(home)
+        if cli.return_home and home is not None:
+            try:
+                source.go_to(home, cli.settle_sec, cli.tf_dwell_sec)
+            except Exception as exc:  # noqa: BLE001
+                log.error(f'Return-home failed: {exc}')
     finally:
         if source is not None:
             source.stop_polling()
