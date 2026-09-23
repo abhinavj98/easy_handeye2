@@ -22,10 +22,10 @@ robot:
   # tracking error for distance to the singularity; an always-on nullspace
   # term climbs log-manipulability. If the target can't be reached safely the
   # move stops at the closest safe pose (stall / joint limits / timeout).
-  dls_kp_pos: 2.0                    # proportional gain on position error (1/s)
+  dls_kp_pos: 5.0                    # proportional gain on position error (1/s)
   dls_kp_rot: 2.0                    # proportional gain on rotation error (1/s)
-  dls_task_vel_pos_m_s: 0.03         # max task-space linear speed
-  dls_task_vel_rot_rad_s: 0.15       # max task-space angular speed
+  dls_task_vel_pos_m_s: 0.2         # max task-space linear speed
+  dls_task_vel_rot_rad_s: 0.60       # max task-space angular speed
   dls_sigma_avoid: 0.10              # below this: extra damping, stronger nullspace push, posture pull
   dls_sigma_floor: 0.05              # barrier: sigma_min never commanded below this
   dls_sigma_stop: 0.03               # hard-stop backstop (should never trigger with the barrier)
@@ -33,13 +33,13 @@ robot:
   dls_null_grad_gain_min: 0.02       # always-on log-manipulability ascent gain
   dls_null_grad_gain_max: 0.2        # ... ramped up to this as sigma_min -> floor
   dls_null_gain_max: 0.5             # posture pull toward dls_escape_q_preferred, ramps in below dls_sigma_avoid
-  dls_null_vel_max: 0.2              # rad/s cap on nullspace self-motion
+  dls_null_vel_max: 0.8              # rad/s cap on nullspace self-motion
   dls_vel_smoothing_sec: 0.05        # 2-stage low-pass on target joint velocity (jerk smoothing; ~0.1 s lag)
   dls_stall_window_sec: 2.0          # time without dls_min_improve progress before stopping
   dls_timeout_sec: 40.0              # overall move cutoff (also bounds the caller's IPC wait, +30s margin)
   dls_log_interval_sec: 0.5          # how often to append a progress log line
-  dls_plan_limit_frac: 0.25          # per-cycle step uses this fraction of vel/acc/jerk limits
-  dls_rate_limit_frac: 0.7           # rate-limiter safety net (must stay < 1)
+  dls_plan_limit_frac: 0.5           # per-cycle step uses this fraction of vel/acc/jerk limits
+  dls_rate_limit_frac: 0.85          # rate-limiter safety net (must stay < 1)
   dls_lambda_min: 0.05               # damping away from singularities
   dls_lambda_max: 0.15               # extra damping blended in as sigma_min -> 0 (below dls_sigma_avoid)
   dls_joint_limit_margin_rad: 0.1    # keep this far inside FR3 joint limits

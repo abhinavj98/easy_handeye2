@@ -8,7 +8,8 @@ which uses the same readOnce/writeOnce API):
   ``joint_motion_generator_velocity_discontinuity``; implied jerk above kMaxJointJerk
   reports ``joint_motion_generator_acceleration_discontinuity``. The external-loop API
   does *not* rate-limit for you, so every command goes through ``limit_rate_joint_positions``
-  (a port of ``franka::limitRate``) against the robot-reported q_d/dq_d/ddq_d.
+  (a port of ``franka::limitRate``) against the robot-reported q_d/dq_d/ddq_d, so a
+  dropped (late) command is absorbed smoothly instead of the next one looking like a jump.
 * Each DLS hop is a quintic (minimum-jerk) blend, zero velocity and acceleration at both
   ends, with duration sized so its peak velocity/acceleration/jerk stay well inside the
   limits. The rate limiter is then only a safety net.
@@ -501,24 +502,21 @@ def limit_rate_joint_positions(
 
 
 class JointPositionStreamer:
-    """Owns one active joint position control session: every command is rate
-    limited against *our own* last-commanded q/dq/ddq (the first cycle uses
-    the measured q with zero velocity/acceleration, exactly like libfranka's
-    example) — tracked directly from what ``send()`` itself just computed and
-    wrote, never re-derived from a subsequent ``readOnce()``.
+    """Owns one active joint position control session. Every command is rate
+    limited against the robot-reported ``q_d/dq_d/ddq_d`` of the state it
+    answers (``self.state``, from the ``readOnce()`` just before the write),
+    like libfranka's own ``limitRate`` in ``Robot::control``.
 
-    This matters: ``readOnce()``'s reported ``q_d/dq_d/ddq_d`` reflects
-    whatever timing/buffering the underlying control loop actually has, which
-    isn't guaranteed to be perfectly synchronous with the ``writeOnce()`` that
-    immediately preceded it. Rate-limiting against a reference that could be
-    even one cycle stale relative to what ``writeOnce()`` actually validates
-    against is exactly the kind of gap that produces a real
-    ``joint_motion_generator_*_discontinuity`` fault — the client and the
-    robot's own validator would be reasoning from different "last state"
-    values. Tracking our own last-sent q_cmd (which is, by construction,
-    exactly what the immediately following ``writeOnce()`` validates against)
-    removes that gap entirely, matching libfranka's own external-control-loop
-    examples, which keep this state client-side rather than re-reading it."""
+    That state is exactly what the robot validates the next command against.
+    When every command is accepted it equals our own last command, but when
+    the robot drops one (it arrived too late for its tick: q_d stays put and
+    control_command_success_rate falls), only the robot's values know it.
+    Limiting against our own last command instead assumed the dropped
+    commands were applied, so the next accepted one looked like a jump and
+    tripped ``joint_motion_generator_acceleration_discontinuity`` on the FR3.
+
+    States without ``q_d/dq_d/ddq_d`` (simple test doubles) fall back to our
+    own last-commanded q/dq/ddq."""
 
     def __init__(
         self,
@@ -537,6 +535,20 @@ class JointPositionStreamer:
         self._last_q = self.measured_q()
         self._last_dq = np.zeros(7)
         self._last_ddq = np.zeros(7)
+        self._last_q, self._last_dq, self._last_ddq = self._reference()
+
+    def _reference(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """(q, dq, ddq) to rate-limit the next command against: the robot's
+        q_d/dq_d/ddq_d when the state reports them, else our own last command."""
+        s = self.state
+        q_d = getattr(s, "q_d", None)
+        dq_d = getattr(s, "dq_d", None)
+        ddq_d = getattr(s, "ddq_d", None)
+        if q_d is None or dq_d is None or ddq_d is None:
+            return self._last_q, self._last_dq, self._last_ddq
+        return (np.asarray(q_d, dtype=float).reshape(7),
+                np.asarray(dq_d, dtype=float).reshape(7),
+                np.asarray(ddq_d, dtype=float).reshape(7))
 
     def measured_q(self) -> np.ndarray:
         return np.asarray(self.state.q, dtype=float).copy()
@@ -556,15 +568,15 @@ class JointPositionStreamer:
         q_d stays put), and the next accepted command then looks like a jump:
         joint_motion_generator_*_discontinuity. On the FR3 a few hundred µs of
         planning between read and write was enough to drop every command."""
+        ref_q, ref_dq, ref_ddq = self._reference()
         q_cmd = limit_rate_joint_positions(
-            target_q, self._last_q, self._last_dq, self._last_ddq,
-            self._vel, self._acc, self._jerk)
+            target_q, ref_q, ref_dq, ref_ddq, self._vel, self._acc, self._jerk)
         cmd = self._make(q_cmd.tolist())
         if finished:
             cmd.motion_finished = True
         self._ctrl.writeOnce(cmd)
-        new_dq = (q_cmd - self._last_q) / DT
-        new_ddq = (new_dq - self._last_dq) / DT
+        new_dq = (q_cmd - ref_q) / DT
+        new_ddq = (new_dq - ref_dq) / DT
         self._last_q, self._last_dq, self._last_ddq = q_cmd, new_dq, new_ddq
         return q_cmd
 
@@ -572,6 +584,11 @@ class JointPositionStreamer:
         """Block until the next robot state (the next 1 kHz tick)."""
         self.state, _ = self._ctrl.readOnce()
         return self.state
+
+    @property
+    def reference_q(self) -> np.ndarray:
+        """The q the next ``write`` is rate-limited against (robot q_d when reported)."""
+        return self._reference()[0].copy()
 
     @property
     def last_command(self) -> np.ndarray:
@@ -1012,12 +1029,15 @@ def run_continuous_dls_move(
     def write_velocity(v_goal: np.ndarray) -> np.ndarray:
         # Smooth, then slew-limit, the commanded velocity so the reference is jerk- and
         # acceleration-smooth before the rate limiter (see module docstring).
-        # q_plan/v_cmd come from write()'s own return value, never a later readOnce().
+        # Integrate from the stream's reference (the robot's q_d), not our last command:
+        # identical while every command is accepted, but after a dropped one it resumes
+        # from where the robot actually is instead of chasing the lost steps.
         nonlocal q_plan, v_cmd, need_read
         v_prev = v_cmd
+        q_ref = stream.reference_q
         v_cmd = slew_limit_velocity(v_cmd, smoother.step(v_goal), p.plan_acc, DT)
-        sent = stream.write(q_plan + v_cmd * DT)
-        v_cmd = (sent - q_plan) / DT
+        sent = stream.write(q_ref + v_cmd * DT)
+        v_cmd = (sent - q_ref) / DT
         q_plan = sent
         need_read = True
         return v_prev

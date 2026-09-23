@@ -104,36 +104,6 @@ class StrictFakeFci:
             self.finished = True
 
 
-class LaggyFakeFci(StrictFakeFci):
-    """Like StrictFakeFci, but ``readOnce()`` reports state that lags one
-    ``writeOnce()`` behind — approximating the round-trip latency between a
-    real robot's control loop and our external readOnce/writeOnce driver
-    (StrictFakeFci's synchronous q==q_d tracking is what let the windup and
-    discontinuity bugs through unit tests but not real hardware). Every
-    ``writeOnce()`` still validates against the *true* last-applied state, so
-    a client that computes its next command off this stale reference still
-    gets caught here if that produces a genuine discontinuity."""
-
-    def __init__(self, q0):
-        super().__init__(q0)
-        self._queue = [self._snapshot()]
-
-    def _snapshot(self):
-        return SimpleNamespace(
-            q=self.q_d.copy(), q_d=self.q_d.copy(), dq_d=self.dq_d.copy(),
-            ddq_d=self.ddq_d.copy(), dq=self.dq_d.copy())
-
-    def readOnce(self):
-        s = self._queue.pop(0)
-        if not self._queue:
-            self._queue.append(self._snapshot())
-        return s, None
-
-    def writeOnce(self, cmd):
-        super().writeOnce(cmd)
-        self._queue.append(self._snapshot())
-
-
 def _make_cmd(q):
     return SimpleNamespace(q=q, motion_finished=False)
 
@@ -609,46 +579,6 @@ def test_slew_limit_velocity_converges_monotonically_to_a_fixed_target():
     np.testing.assert_allclose(v, target, atol=1e-9)
 
 
-@pytest.mark.parametrize("smooth", [True, False])
-def test_continuous_tracker_survives_state_report_latency(smooth):
-    """Regression test for the real-hardware fault: with the original
-    JointPositionStreamer (which re-derived its rate-limiting reference from
-    a subsequent readOnce() every cycle), LaggyFakeFci's one-cycle report lag
-    was enough to make the loop command a real discontinuity, independent of
-    whether the caller's own steps were smoothed. Now that the streamer
-    tracks its own last-commanded q/dq/ddq directly from what it just wrote
-    (never re-derived from a read), this scenario completes cleanly either
-    way — see JointPositionStreamer's docstring for why that's the layer
-    that actually has to be lag-immune."""
-    p = _params()
-    J = np.eye(6, 7)
-    q_goal = Q_HOME + np.array([0.05, -0.04, 0.03, 0.06, -0.05, 0.04, 0.0])
-    x_goal = J @ q_goal
-
-    fci = LaggyFakeFci(Q_HOME)
-    stream = _streamer(fci, p)
-    q_plan = stream.measured_q()
-    stream.hold(q_plan, p.hold_first_steps)
-    # _run_continuous itself raising is the failure this test targets — a real
-    # joint_motion_generator_*_discontinuity fault from LaggyFakeFci's strict
-    # validation. Reaching *any* clean stop reason (converged, or stalled from
-    # delayed-feedback oscillation when unsmoothed) demonstrates that.
-    q_plan, _, reason = _run_continuous(
-        stream, q_plan, J, x_goal, p, max_cycles=20_000, smooth=smooth)
-    assert reason in ("converged", "stalled")
-
-    if smooth:
-        # Only the smoothed (production) path is expected to actually reach
-        # the target and decelerate to zero cleanly; finish()'s "hold until
-        # quiet" is a separate concern from the discontinuity-fault question
-        # this test targets, and the unsmoothed comparison path was never
-        # meant to finish cleanly (or even necessarily converge, under
-        # delayed feedback with no damping on the raw target).
-        assert reason == "converged"
-        stream.finish(q_plan, p.finish_max_steps)
-        assert fci.finished
-
-
 def test_raw_continuous_step_output_can_jump_between_cycles_unlike_smoothed():
     """continuous_dls_step re-solves from scratch every call, so nothing
     guarantees consecutive raw outputs are acceleration-bounded the way a
@@ -1060,3 +990,75 @@ def test_velocity_smoother_turns_a_one_cycle_spike_into_a_small_bump():
     a = np.diff(v) / DT
     assert np.abs(a).max() < 0.5          # vs 2.5 rad/s^2 bang-bang before
     assert abs(v[0]) < 0.01 * 0.01        # starts from rest, no velocity step
+
+
+class DroppingFakeFci(KinematicFakeFci):
+    """Like the FR3 when commands arrive too late: in each ``drops`` window
+    ``(start_cycle, n)`` it ignores ``n`` consecutive writes. q_d stays put (and
+    dq_d/ddq_d read zero, the robot holding), and every later command is still
+    validated against that held state, which is what the robot reports."""
+
+    def __init__(self, q0, drops):
+        super().__init__(q0)
+        self.drops = list(drops)
+        self.writes = 0
+        self.dropped = 0
+
+    def writeOnce(self, cmd):
+        n = self.writes
+        self.writes += 1
+        if not getattr(cmd, "motion_finished", False) and any(
+                start <= n < start + k for start, k in self.drops):
+            self.dropped += 1
+            self.dq_d = np.zeros(7)
+            self.ddq_d = np.zeros(7)
+            return
+        super().writeOnce(cmd)
+
+
+class OwnReferenceFci(DroppingFakeFci):
+    """Hides q_d/dq_d/ddq_d from the reported state, so the streamer falls back
+    to rate-limiting against its own last command (the old behavior)."""
+
+    def readOnce(self):
+        s, _ = super().readOnce()
+        for name in ("q_d", "dq_d", "ddq_d"):
+            delattr(s, name)
+        return s, None
+
+
+def _dropping_move_target():
+    T0 = fr3_fk(FR3_READY_Q)[0]
+    T = T0.copy()
+    T[:3, 3] += (0.05, -0.03, 0.02)
+    return T
+
+
+# Mid-move bursts the size seen in the hardware log (7 and 20 ticks of frozen q_d).
+_DROPS = [(300, 7), (700, 20), (1100, 3)]
+
+
+def test_fr3_move_rides_through_dropped_commands():
+    """Regression for the hardware acceleration_discontinuity: the robot dropped
+    7-20 consecutive commands, then the next accepted one looked like a jump
+    because the streamer rate-limited against its own (never applied) commands.
+    Limiting against the robot-reported q_d/dq_d/ddq_d absorbs the drops."""
+    T = _dropping_move_target()
+    p = _params()
+    fci = DroppingFakeFci(FR3_READY_Q, _DROPS)
+    stream = _streamer(fci, p)
+    result = run_continuous_dls_move(stream, _fr3_read, T[:3, :3], T[:3, 3], p)
+    assert fci.dropped == sum(k for _, k in _DROPS)
+    assert result.stop_reason == "converged"
+    assert fci.finished
+
+
+def test_own_reference_rate_limiting_faults_on_dropped_commands():
+    """The old behavior, kept as a guard: without the robot's q_d/dq_d/ddq_d the
+    first command accepted after a drop burst is a discontinuity."""
+    T = _dropping_move_target()
+    p = _params()
+    fci = OwnReferenceFci(FR3_READY_Q, _DROPS)
+    stream = _streamer(fci, p)
+    with pytest.raises(RuntimeError, match="discontinuity"):
+        run_continuous_dls_move(stream, _fr3_read, T[:3, :3], T[:3, 3], p)

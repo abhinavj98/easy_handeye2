@@ -676,29 +676,21 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                     response_queue.put(("error", str(e)))
 
             elif cmd[0] == "sample_state":
+                # Plain read_once(), no control session: a Cartesian session here was
+                # rejected by libfranka ("cannot start at singular pose") whenever a DLS
+                # move had stopped near the singularity barrier.
                 try:
-                    ctrl = robot.start_cartesian_pose_control(ControllerMode.JointImpedance)
-                    state, _ = ctrl.readOnce()
+                    state = robot.read_once()
 
                     jac_flat = model.zero_jacobian(state)
                     mass_flat = model.mass(state)
                     gravity = model.gravity(state)
                     _pack_state(state, [0.0] * 6, jac_flat, mass_flat, gravity)
                     state_ready.set()
-
-                    ctrl = None
-                    robot.stop()
-                    time.sleep(0.25)
                     response_queue.put(("sample_state_done", None))
                 except Exception as e:
                     sys.stdout.write(f"[COMM PROCESS] State sample failed: {e}\r\n")
                     sys.stdout.flush()
-                    try:
-                        ctrl = None
-                        robot.stop()
-                    except Exception:
-                        pass
-                    time.sleep(0.25)
                     response_queue.put(("error", str(e)))
 
             elif cmd[0] == "move_joints":
@@ -765,6 +757,20 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                 cycle_times_ms = []
                 diag_ring = []
                 _DIAG_MAXLEN = 20
+                # Per-move drop stats, printed for every move (not just failures) to
+                # tell chronic drops (network / realtime setup) from rare ones.
+                drop_stats = {"dropped": 0, "min_success": float("nan")}
+
+                def print_timing():
+                    if cycle_times_ms:
+                        arr = np.asarray(cycle_times_ms)
+                        sys.stdout.write(
+                            f"[COMM PROCESS] DLS cycle timing: n={arr.size} mean={arr.mean():.3f}ms "
+                            f"max={arr.max():.3f}ms p99={np.percentile(arr, 99):.3f}ms "
+                            f"n_over_1.5ms={int(np.sum(arr > 1.5))} "
+                            f"dropped_cmds={drop_stats['dropped']} "
+                            f"min_success_rate={drop_stats['min_success']:.3f}\r\n")
+
                 dls_failure = None
                 try:
                     from easy_handeye2_franka_auto.dls_motion import (
@@ -812,13 +818,19 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                         # are being dropped (late or lost) and a *_discontinuity follows.
                         s = stream.state
                         q_d = np.asarray(getattr(s, "q_d", sent), dtype=float)
+                        qd_vs_prev = float(np.max(np.abs(q_d - prev)))
+                        success = float(getattr(s, "control_command_success_rate", float("nan")))
+                        if qd_vs_prev > 1e-9:
+                            drop_stats["dropped"] += 1
+                        if not success >= drop_stats["min_success"]:  # also replaces the initial nan
+                            drop_stats["min_success"] = success
                         diag_ring.append((
                             cycle, cycle_dt_ms,
                             float(np.max(np.abs(v_cmd)) / np.max(p.rate_vel)),
                             float(np.max(np.abs(v_cmd - v_prev)) / DT / np.max(p.rate_acc)),
                             float(np.max(np.abs(q_d - sent))),
-                            float(np.max(np.abs(q_d - prev))),
-                            float(getattr(s, "control_command_success_rate", float("nan"))),
+                            qd_vs_prev,
+                            success,
                         ))
                         if len(diag_ring) > _DIAG_MAXLEN:
                             diag_ring.pop(0)
@@ -847,12 +859,7 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
 
                     for line in hop_log:
                         sys.stdout.write(f"[COMM PROCESS] DLS {line}\r\n")
-                    if cycle_times_ms:
-                        arr = np.asarray(cycle_times_ms)
-                        sys.stdout.write(
-                            f"[COMM PROCESS] DLS cycle timing: n={arr.size} mean={arr.mean():.3f}ms "
-                            f"max={arr.max():.3f}ms p99={np.percentile(arr, 99):.3f}ms "
-                            f"n_over_1.5ms={int(np.sum(arr > 1.5))}\r\n")
+                    print_timing()
                     sys.stdout.write(
                         f"[COMM PROCESS] DLS move done ({result.stop_reason}): "
                         f"pos_err={result.pos_err_m:.4f}m, rot_err={result.rot_err_rad:.4f}rad, "
@@ -863,12 +870,7 @@ def _comm_process_fn(state_shm, torque_shm, cmd_queue, response_queue,
                 except Exception as e:
                     for line in hop_log:
                         sys.stdout.write(f"[COMM PROCESS] DLS {line}\r\n")
-                    if cycle_times_ms:
-                        arr = np.asarray(cycle_times_ms)
-                        sys.stdout.write(
-                            f"[COMM PROCESS] DLS cycle timing: n={arr.size} mean={arr.mean():.3f}ms "
-                            f"max={arr.max():.3f}ms p99={np.percentile(arr, 99):.3f}ms "
-                            f"n_over_1.5ms={int(np.sum(arr > 1.5))}\r\n")
+                    print_timing()
                     for rec in diag_ring:
                         c, dt_ms, vfrac, afrac, qd_vs_sent, qd_vs_prev, success = rec
                         sys.stdout.write(
@@ -1310,9 +1312,9 @@ class FrankaInterface:
     def refresh_state_snapshot(self):
         """Refresh shared-memory state from the robot without moving it.
 
-        Starts a short idle Cartesian control session, samples the current
-        pose/state, and updates shared memory so manual positioning can be
-        captured before torque mode starts.
+        Reads one robot state with robot.read_once() (no control session, so it
+        works at near-singular poses too) and updates shared memory so manual
+        positioning can be captured before torque mode starts.
         """
         self._cmd_queue.put(("sample_state",))
         resp = self._response_queue.get(timeout=10.0)
