@@ -8,6 +8,8 @@ pose, and call `easy_handeye2` sample/compute/save services.
 Design: `docs/superpowers/specs/2026-09-21-cube-subset-poses-design.md`  
 (Package bring-up: `docs/superpowers/specs/2026-09-21-franka-auto-handeye-design.md`)
 
+End-to-end guide (concepts, frames, workflow, verification): [docs/franka_eye_on_base_calibration.md](../docs/franka_eye_on_base_calibration.md)
+
 ## Pose set
 
 From free-drive home:
@@ -30,9 +32,10 @@ pose already sampled, so short DLS stops don't add near-duplicate samples
 
 ## Prerequisites
 
-1. Start camera/marker publishers and `calibrate.launch.py` with
-   `calibration_type:=eye_on_base`, matching `name` / robot frames, and
-   freehand movement (default).
+1. Start camera, ChArUco detector and `handeye_server` with
+   `ros2 launch easy_handeye2_charuco eye_on_base_calib.launch.py name:=<name>`
+   (see `easy_handeye2_charuco/README.md`), using the same `name` and robot
+   frames as below, with the board visible to the camera.
 2. Ensure **`franka_ros2` hardware control is not connected** — pylibfranka
    must be the sole FCI client.
 3. Build and source this workspace.
@@ -94,6 +97,46 @@ Useful flags:
 - `--keep-existing-samples` — do not clear samples already on the handeye server
 
 Pre-existing samples are cleared at start unless `--keep-existing-samples`.
+
+## Verify a calibration
+
+Every run saves its raw samples to `~/.ros2/easy_handeye2/samples/<name>.samples`
+(`<name>` is the `name` handeye_server was launched with). The board is rigid on
+the EE, so the board pose `T_ee<-board = robot_i · calib · tracking_i` must be the
+same for every sample. How much it varies is the calibration error.
+
+**Quality report.** `handeye_auto_calibrate` prints it automatically right after
+computing the calibration, before saving. A BAD verdict adds a warning, but the
+result is still saved. To print it again later from the saved files (no robot needed):
+
+```bash
+ros2 run easy_handeye2_franka_auto evaluate_calibration --name fr3_eob
+```
+
+The report shows:
+- the camera pose and board-in-EE pose, to check against a tape measure and
+  the physical mount
+- EE rotation diversity
+- the base-frame board error for each sample under the saved calibration
+  (fit), plus leave-one-out (each sample checked against a calibration solved
+  without it)
+- agreement between the five OpenCV solvers
+- a verdict: GOOD ≤ 3 mm / 0.5°, BAD ≥ 10 mm / 2° (worst of fit and LOO RMS)
+
+The exit code is 2 when the verdict is BAD. `--samples` / `--calibration`
+evaluate arbitrary files.
+
+**Live check** after publishing (moves nothing; hand-guide between still poses):
+
+```bash
+ros2 launch franka_bringup franka.launch.py robot_ip:=192.168.1.11   # live robot TF (after calibration!)
+ros2 launch easy_handeye2_charuco charuco_view.launch.py use_rviz:=false
+ros2 launch easy_handeye2 publish.launch.py name:=fr3_eob
+ros2 run easy_handeye2_franka_auto handeye_consistency_monitor       # --effector fr3_link8 by default
+```
+
+It records the board-in-EE pose at each new still pose and prints its spread.
+This uses the same metric as the offline fit, so aim for a few mm.
 
 ## Manual checklist
 

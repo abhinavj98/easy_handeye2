@@ -23,6 +23,10 @@ example for integrating `easy_handeye2` into your own launch scripts.
 
 This is a port of [easy_handeye](https://github.com/IFL-CAMP/easy_handeye) to ROS2.
 
+**Franka FR3 + RealSense + ChArUco (this fork):** automated eye-on-base calibration with
+quality report. See [docs/franka_eye_on_base_calibration.md](docs/franka_eye_on_base_calibration.md)
+(packages `easy_handeye2_charuco`, `easy_handeye2_franka_auto`).
+
 ## News
 - version 0.5.0
     - port to ROS2
