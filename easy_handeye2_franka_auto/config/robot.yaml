@@ -36,7 +36,7 @@ robot:
   dls_null_vel_max: 0.8              # rad/s cap on nullspace self-motion
   dls_vel_smoothing_sec: 0.05        # 2-stage low-pass on target joint velocity (jerk smoothing; ~0.1 s lag)
   dls_stall_window_sec: 2.0          # time without dls_min_improve progress before stopping
-  dls_timeout_sec: 40.0              # overall move cutoff (also bounds the caller's IPC wait, +30s margin)
+  dls_timeout_sec: 15.0              # overall move cutoff (also bounds the caller's IPC wait, +30s margin)
   dls_log_interval_sec: 0.5          # how often to append a progress log line
   dls_plan_limit_frac: 0.5           # per-cycle step uses this fraction of vel/acc/jerk limits
   dls_rate_limit_frac: 0.85          # rate-limiter safety net (must stay < 1)
