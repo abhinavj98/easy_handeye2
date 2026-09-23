@@ -16,6 +16,8 @@
     <exec_depend>geometry_msgs</exec_depend>
     <exec_depend>easy_handeye2</exec_depend>
     <exec_depend>easy_handeye2_msgs</exec_depend>
+    <exec_depend>python3-yaml</exec_depend>
+    <!-- evaluate_calibration uses cv2.calibrateHandEye (any OpenCV >= 4.1) -->
 
     <test_depend>python3-pytest</test_depend>
 

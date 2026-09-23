@@ -16,6 +16,26 @@ def sample_added(n_before: int, n_after: int) -> bool:
     return n_after > n_before
 
 
+def _print_quality_report(samples, calibration, log) -> None:
+    """Same report as evaluate_calibration, on the in-memory samples + fresh result."""
+    try:
+        from easy_handeye2_franka_auto.evaluate_calibration import print_report
+        from easy_handeye2_franka_auto.handeye_eval import transform_msg_to_4x4
+
+        robot = [transform_msg_to_4x4(s.robot) for s in samples]
+        tracking = [transform_msg_to_4x4(s.tracking) for s in samples]
+        p = calibration.parameters
+        print('\n' + '=' * 72, flush=True)
+        grade = print_report(robot, tracking, transform_msg_to_4x4(calibration.transform),
+                             f'Calibration (new): {p.robot_base_frame} -> {p.tracking_base_frame}')
+        print('=' * 72 + '\n', flush=True)
+        if grade == 'BAD':
+            log.warn('Quality report verdict is BAD; saving anyway -- consider re-running '
+                     '(see the report above)')
+    except Exception as exc:  # noqa: BLE001 - never let the report block saving
+        log.error(f'Quality report failed: {exc}')
+
+
 def _parse_args(argv):
     p = argparse.ArgumentParser(description='Automated eye-on-base hand-eye sampling')
     p.add_argument('--robot-config', type=Path, required=True)
@@ -59,7 +79,9 @@ def main(args=None):
     from rclpy.utilities import remove_ros_args
 
     from easy_handeye2.handeye_client import HandeyeClient
+    from easy_handeye2 import SAVE_SAMPLES_TOPIC
     from easy_handeye2_msgs.msg import HandeyeCalibrationParameters
+    from easy_handeye2_msgs.srv import SaveSamples
     from easy_handeye2_franka_auto.handeye_offsets import (
         compute_cube_poses,
         is_distinct,
@@ -187,10 +209,20 @@ def main(args=None):
             f'sample_failed={sample_failed}'
         )
 
+        # Keep the raw samples (server writes ~/.ros2/easy_handeye2/samples/<name>.samples,
+        # <name> = the server's name parameter) for evaluate_calibration.
+        save_samples = node.create_client(SaveSamples, SAVE_SAMPLES_TOPIC)
+        if save_samples.wait_for_service(timeout_sec=5.0) and \
+                save_samples.call(SaveSamples.Request()).success:
+            log.info('Saved samples to ~/.ros2/easy_handeye2/samples/ (evaluate with evaluate_calibration)')
+        else:
+            log.error('save_samples failed; evaluate_calibration will not have this run')
+
         total = n_samples()
         if should_save(total, cli.min_samples):
             result = client.compute_calibration()
             if result.valid:
+                _print_quality_report(client.get_sample_list().samples, result.calibration, log)
                 saved = client.save()
                 log.info(f'Saved calibration ({total} samples): success={saved.success}')
             else:

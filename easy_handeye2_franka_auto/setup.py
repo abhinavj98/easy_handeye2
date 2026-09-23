@@ -24,6 +24,8 @@ setup(
         'console_scripts': [
             'handeye_auto_calibrate = easy_handeye2_franka_auto.handeye_auto_calibrate:main',
             'handeye_motion_test = easy_handeye2_franka_auto.handeye_motion_test:main',
+            'evaluate_calibration = easy_handeye2_franka_auto.evaluate_calibration:main',
+            'handeye_consistency_monitor = easy_handeye2_franka_auto.handeye_consistency_monitor:main',
         ],
     },
 )
